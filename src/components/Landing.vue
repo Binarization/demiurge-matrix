@@ -118,6 +118,115 @@ const progressPathRef = ref<SVGPathElement | null>(null);
 const progressThickness = ref(18);
 
 const progressDisplay = computed(() => `${Math.round(loadProgress.value)}%`);
+const initWords = ['初始化', '桃子', '温柔', '迷迷', '昔涟', '德谬歌', '你好', '世界', '明天见'];
+const scrambleChars = '!@#$%^&*()_+-=[]{}<>?/\\|';
+const scrambledInitWord = ref(initWords[0] ?? '');
+const currentInitWord = computed(() => {
+  if (!initWords.length) {
+    return '';
+  }
+  const index = Math.min(initWords.length - 1, Math.floor((loadProgress.value / 100) * initWords.length));
+  return initWords[index]!;
+});
+
+const makeRandomString = (length: number) => {
+  if (length <= 0) {
+    return '';
+  }
+  let result = '';
+  for (let i = 0; i < length; i += 1) {
+    const randomChar = scrambleChars[Math.floor(Math.random() * scrambleChars.length)] ?? '';
+    result += randomChar;
+  }
+  return result;
+};
+
+const scrambleWord = (word: string, stability: number) => {
+  if (!word) {
+    return '';
+  }
+  const clamped = Math.min(1, Math.max(0, stability));
+  return word
+    .split('')
+    .map((char) => {
+      if (Math.random() < clamped) {
+        return char;
+      }
+      const randomChar = scrambleChars[Math.floor(Math.random() * scrambleChars.length)];
+      return randomChar ?? char;
+    })
+    .join('');
+};
+
+type ScrambleStage = 'idle' | 'fadeOut' | 'glitch' | 'fadeIn' | 'complete';
+let lastScrambleStage: ScrambleStage = 'idle';
+let lastScrambleIndex = -1;
+let glitchSnapshot = '';
+let fadeInSnapshot = '';
+
+const updateScrambledWord = () => {
+  const totalWords = initWords.length;
+  if (!totalWords) {
+    scrambledInitWord.value = '';
+    return;
+  }
+
+  if (loadProgress.value >= 100) {
+    scrambledInitWord.value = initWords[totalWords - 1]!;
+    lastScrambleStage = 'complete';
+    lastScrambleIndex = totalWords - 1;
+    return;
+  }
+
+  const segmentSize = 100 / totalWords;
+  const progress = Math.max(0, Math.min(loadProgress.value, 99.999));
+  const currentIndex = Math.min(totalWords - 1, Math.floor(progress / segmentSize));
+  const currentWord = initWords[currentIndex] ?? '';
+  const previousWord = currentIndex > 0 ? initWords[currentIndex - 1]! : currentWord;
+  const segmentProgress = segmentSize ? (progress % segmentSize) / segmentSize : 0;
+
+  const fadeOutDuration = currentIndex === 0 ? 0 : 0.15;
+  const glitchHold = currentIndex === 0 ? 0 : 0.02;
+  const fadeInStart = currentIndex === 0 ? 0 : fadeOutDuration + glitchHold;
+  const fadeInDuration = Math.max(0.0001, 1 - fadeInStart);
+
+  if (currentIndex > 0 && segmentProgress < fadeOutDuration) {
+    lastScrambleStage = 'fadeOut';
+    lastScrambleIndex = currentIndex;
+    const ratio = fadeOutDuration ? segmentProgress / fadeOutDuration : 1;
+    const stability = Math.max(0, 1 - ratio * 1.2);
+    scrambledInitWord.value = scrambleWord(previousWord, stability);
+    return;
+  }
+
+  if (currentIndex > 0 && segmentProgress < fadeInStart) {
+    if (lastScrambleStage !== 'glitch' || lastScrambleIndex !== currentIndex) {
+      glitchSnapshot = scrambleWord(previousWord, 0);
+    }
+    lastScrambleStage = 'glitch';
+    lastScrambleIndex = currentIndex;
+    scrambledInitWord.value = glitchSnapshot;
+    return;
+  }
+
+  if (lastScrambleStage !== 'fadeIn' || lastScrambleIndex !== currentIndex || fadeInSnapshot.length !== currentWord.length) {
+    fadeInSnapshot = makeRandomString(currentWord.length || 1);
+  }
+  lastScrambleStage = 'fadeIn';
+  lastScrambleIndex = currentIndex;
+
+  const fadeInProgress = (segmentProgress - fadeInStart) / fadeInDuration;
+  const eased = Math.min(1, Math.max(0, fadeInProgress ** 2 * (3 - 2 * fadeInProgress)));
+  const len = currentWord.length || fadeInSnapshot.length;
+  const result = currentWord
+    .split('')
+    .map((char, index) => {
+      const threshold = len ? index / len : 1;
+      return eased > threshold ? char : fadeInSnapshot[index] ?? char;
+    })
+    .join('');
+  scrambledInitWord.value = result || currentWord;
+};
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
@@ -591,6 +700,7 @@ const animate = () => {
   if (loadProgress.value <= 100) {
     loadProgress.value += 0.05;
   }
+  updateScrambledWord();
   drawParticles();
   state.rafId = requestAnimationFrame(animate);
 };
@@ -697,6 +807,9 @@ onUnmounted(() => {
     <div class="progress-label">
       <span>{{ progressDisplay }}</span>
     </div>
+    <div class="init-label">
+      <span>{{ scrambledInitWord || currentInitWord }}</span>
+    </div>
   </div>
 </template>
 
@@ -756,8 +869,8 @@ onUnmounted(() => {
 
 .progress-label {
   position: fixed;
-  left: 0px;
-  bottom: 0px;
+  left: 2px;
+  bottom: 2px;
   font-size: 10rem;
   font-family: 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
   font-weight: 300;
@@ -770,6 +883,24 @@ onUnmounted(() => {
 .progress-label span {
   display: inline-block;
   padding-bottom: 0.1em;
+}
+
+.init-label {
+  position: fixed;
+  top: 2px;
+  right: 2px;
+  font-size: 9rem;
+  font-family: 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
+  font-weight: 300;
+  line-height: 0.65;
+  color: #fff;
+  mix-blend-mode: difference;
+  pointer-events: none;
+}
+
+.init-label span {
+  display: inline-block;
+  padding-top: 0.1em;
 }
 
 </style>
