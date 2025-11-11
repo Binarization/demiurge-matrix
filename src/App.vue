@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from 'vue';
 import Landing from './components/Landing.vue';
-import NextSection from './components/NextSection.vue';
+import Core from './components/Core.vue';
+import PointerOverlay from './components/PointerOverlay.vue';
 
 type CurtainPhase = 'idle' | 'hold' | 'fade';
 const CURTAIN_FADE_DELAY = 400;
@@ -44,7 +45,8 @@ onBeforeUnmount(() => {
 <template>
   <div class="app-root">
     <Landing v-if="!showNextSection" @complete="handleLandingComplete" />
-    <NextSection v-else />
+    <Core v-else />
+    <PointerOverlay />
     <div
       class="white-curtain"
       :class="{
@@ -59,6 +61,10 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+:global(html, body, #app) {
+  cursor: none;
+}
+
 .app-root {
   position: relative;
 }

@@ -42,13 +42,6 @@ type CubeState = {
   floatPhase: number;
 };
 
-type TrailPoint = {
-  x: number;
-  y: number;
-  life: number;
-  velocity: number;
-};
-
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 
 const PARTICLE_COUNT = 600;
@@ -111,7 +104,6 @@ const state = {
   } as CubeState,
   pulsePhase: 0,
   gridPhase: 0,
-  trail: [] as TrailPoint[],
   rafId: 0,
 };
 
@@ -528,82 +520,6 @@ const drawCubeAndOrb = () => {
   ctx.restore();
 };
 
-const drawPointerCue = () => {
-  if (!state.ctx || !state.mouse.active) {
-    return;
-  }
-  const ctx = state.ctx;
-  ctx.save();
-  ctx.globalCompositeOperation = 'screen';
-  const pulse = 0.5 + 0.5 * Math.sin(state.cube.floatPhase * 3);
-  const radius = 12 + pulse * 9;
-  ctx.strokeStyle = `rgba(120, 210, 255, ${0.25 + pulse * 0.2})`;
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.arc(state.mouse.x, state.mouse.y, radius, 0, Math.PI * 2);
-  ctx.stroke();
-
-  ctx.fillStyle = `rgba(120, 210, 255, ${0.08 + pulse * 0.1})`;
-  ctx.beginPath();
-  ctx.arc(state.mouse.x, state.mouse.y, 2 + pulse * 2, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-};
-
-const drawPointerTrail = () => {
-  if (!state.ctx || state.trail.length < 2) {
-    return;
-  }
-  const ctx = state.ctx;
-  ctx.save();
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  const avgLife = state.trail.reduce((acc, point) => acc + point.life, 0) / state.trail.length;
-  const alpha = 0.12 + avgLife * 0.2;
-  ctx.strokeStyle = `rgba(170, 225, 255, ${alpha})`;
-  ctx.lineWidth = 2 + avgLife * 2;
-  ctx.beginPath();
-  ctx.moveTo(state.trail[0]!.x, state.trail[0]!.y);
-  for (let i = 1; i < state.trail.length; i += 1) {
-    const point = state.trail[i]!;
-    ctx.lineTo(point.x, point.y);
-  }
-  ctx.stroke();
-
-  ctx.restore();
-};
-
-const updateTrail = () => {
-  state.trail = state.trail
-    .map((point) => ({
-      ...point,
-      life: point.life - (0.022 + point.velocity * 0.03),
-    }))
-    .filter((point) => point.life > 0);
-};
-
-const pushTrailPoint = (x: number, y: number) => {
-  const prev = state.trail[state.trail.length - 1];
-  const dx = prev ? x - prev.x : 0;
-  const dy = prev ? y - prev.y : 0;
-  const velocity = Math.min(1, Math.hypot(dx, dy) / 50);
-
-  if (state.trail.length > 0) {
-    state.trail = state.trail
-      .map((point, index) => ({
-        ...point,
-        life: point.life - (0.04 + velocity * (index === state.trail.length - 1 ? 0.02 : 0.035)),
-      }))
-      .filter((point) => point.life > 0);
-  }
-
-  state.trail.push({ x, y, life: 1, velocity });
-  if (state.trail.length > 95) {
-    state.trail.splice(0, state.trail.length - 95);
-  }
-};
-
 const updateProgressFrame = () => {
   if (!state.width || !state.height) {
     return;
@@ -714,15 +630,11 @@ const drawParticles = () => {
   });
 
   ctx.restore();
-
-  drawPointerTrail();
-  drawPointerCue();
 };
 
 const animate = () => {
   updateCubeState();
   updateParticles();
-  updateTrail();
   if (loadProgress.value < 100) {
     loadProgress.value = Math.min(100, loadProgress.value + 0.05);
   }
@@ -778,7 +690,6 @@ const handlePointerMove = (event: MouseEvent) => {
   state.mouse.x = event.clientX;
   state.mouse.y = event.clientY;
   state.mouse.active = true;
-  pushTrailPoint(event.clientX, event.clientY);
 };
 
 const handlePointerLeave = () => {
