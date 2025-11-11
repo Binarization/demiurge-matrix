@@ -1,5 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+
+const emit = defineEmits<{
+  (event: 'complete'): void;
+}>();
 
 type PathPoint = {
   x: number;
@@ -111,11 +115,15 @@ const state = {
   rafId: 0,
 };
 
+const EXPLOSION_DURATION = 1400;
+
 const loadProgress = ref(0);
 const progressPath = ref('');
 const progressPathLength = ref(1);
 const progressPathRef = ref<SVGPathElement | null>(null);
 const progressThickness = ref(18);
+const explosionStage = ref<'idle' | 'expanding' | 'complete'>('idle');
+let explosionTimeout: number | undefined;
 
 const progressDisplay = computed(() => `${Math.round(loadProgress.value)}%`);
 const initWords = ['初始化', '桃子', '温柔', '迷迷', '昔涟', '德谬歌', '你好', '世界', '明天见'];
@@ -227,6 +235,24 @@ const updateScrambledWord = () => {
     .join('');
   scrambledInitWord.value = result || currentWord;
 };
+
+const triggerExplosion = () => {
+  if (explosionStage.value !== 'idle') {
+    return;
+  }
+  explosionStage.value = 'expanding';
+  loadProgress.value = 100;
+  explosionTimeout = window.setTimeout(() => {
+    explosionStage.value = 'complete';
+    emit('complete');
+  }, EXPLOSION_DURATION);
+};
+
+watch(loadProgress, (value) => {
+  if (value >= 100) {
+    triggerExplosion();
+  }
+});
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
@@ -697,8 +723,8 @@ const animate = () => {
   updateCubeState();
   updateParticles();
   updateTrail();
-  if (loadProgress.value <= 100) {
-    loadProgress.value += 0.05;
+  if (loadProgress.value < 100) {
+    loadProgress.value = Math.min(100, loadProgress.value + 0.05);
   }
   updateScrambledWord();
   drawParticles();
@@ -772,6 +798,9 @@ onUnmounted(() => {
   window.removeEventListener('resize', handleResize);
   window.removeEventListener('mousemove', handlePointerMove);
   window.removeEventListener('mouseleave', handlePointerLeave);
+  if (explosionTimeout) {
+    window.clearTimeout(explosionTimeout);
+  }
 });
 </script>
 
@@ -809,6 +838,15 @@ onUnmounted(() => {
     </div>
     <div class="init-label">
       <span>{{ scrambledInitWord || currentInitWord }}</span>
+    </div>
+    <div
+      class="explosion-overlay"
+      :class="{
+        'explosion-overlay--active': explosionStage === 'expanding',
+        'explosion-overlay--complete': explosionStage === 'complete',
+      }"
+    >
+      <div class="explosion-square" aria-hidden="true"></div>
     </div>
   </div>
 </template>
@@ -901,6 +939,64 @@ onUnmounted(() => {
 .init-label span {
   display: inline-block;
   padding-top: 0.1em;
+}
+
+.explosion-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  opacity: 0;
+  background: transparent;
+  transition: opacity 0.4s ease, background 0.9s ease;
+  z-index: 10;
+  mix-blend-mode: normal;
+}
+
+.explosion-overlay--active {
+  opacity: 1;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.65) 0%, rgba(255, 255, 255, 0.25) 45%, rgba(255, 255, 255, 0) 80%);
+}
+
+.explosion-overlay--complete {
+  opacity: 1;
+  background: #fff;
+}
+
+.explosion-square {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 96px;
+  height: 96px;
+  background: #fff;
+  transform: translate(-50%, -50%) rotate(45deg) scale(0.2);
+  box-shadow: 0 0 40px rgba(255, 255, 255, 0.9), 0 0 120px rgba(255, 255, 255, 0.6);
+  opacity: 0;
+}
+
+.explosion-overlay--active .explosion-square {
+  animation: explosion-grow 1.2s cubic-bezier(0.19, 1, 0.22, 1) forwards;
+}
+
+@keyframes explosion-grow {
+  0% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(45deg) scale(0.2);
+    box-shadow: 0 0 20px rgba(255, 255, 255, 0.8), 0 0 80px rgba(255, 255, 255, 0.5);
+  }
+  45% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(45deg) scale(3);
+    box-shadow: 0 0 60px rgba(255, 255, 255, 0.95), 0 0 160px rgba(255, 255, 255, 0.65);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(45deg) scale(35);
+    box-shadow: 0 0 120px rgba(255, 255, 255, 1);
+  }
 }
 
 </style>
