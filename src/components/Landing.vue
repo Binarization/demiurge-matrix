@@ -702,27 +702,20 @@ const handleResize = () => {
     // 尝试使用离屏渲染
     let ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null
     
-    if (typeof OffscreenCanvas !== 'undefined' && canvas.transferControlToOffscreen) {
+    if (typeof OffscreenCanvas !== 'undefined' && canvas.transferControlToOffscreen && !state.isOffscreen) {
         try {
-            // 如果还没有创建离屏canvas，则创建
-            if (!offscreenCanvas.value) {
-                canvas.width = innerWidth * dpr
-                canvas.height = innerHeight * dpr
-                canvas.style.width = `${innerWidth}px`
-                canvas.style.height = `${innerHeight}px`
-                
-                offscreenCanvas.value = canvas.transferControlToOffscreen()
-                ctx = offscreenCanvas.value.getContext('2d', { 
-                    alpha: true,
-                    desynchronized: true // 启用低延迟渲染
-                })
-                state.isOffscreen = true
-            } else {
-                // 已经有离屏canvas，直接调整大小
-                offscreenCanvas.value.width = innerWidth * dpr
-                offscreenCanvas.value.height = innerHeight * dpr
-                ctx = offscreenCanvas.value.getContext('2d')
-            }
+            // 首次创建离屏canvas
+            canvas.width = innerWidth * dpr
+            canvas.height = innerHeight * dpr
+            canvas.style.width = `${innerWidth}px`
+            canvas.style.height = `${innerHeight}px`
+            
+            offscreenCanvas.value = canvas.transferControlToOffscreen()
+            ctx = offscreenCanvas.value.getContext('2d', { 
+                alpha: true,
+                desynchronized: true // 启用低延迟渲染
+            })
+            state.isOffscreen = true
         } catch (e) {
             console.warn('Failed to use OffscreenCanvas, falling back to regular canvas:', e)
             // 回退到常规canvas
@@ -733,6 +726,14 @@ const handleResize = () => {
             ctx = canvas.getContext('2d')
             state.isOffscreen = false
         }
+    } else if (state.isOffscreen && offscreenCanvas.value) {
+        // 已经使用离屏canvas，只需调整离屏canvas的大小
+        offscreenCanvas.value.width = innerWidth * dpr
+        offscreenCanvas.value.height = innerHeight * dpr
+        // 同时更新原始canvas的样式大小（不设置width/height属性）
+        canvas.style.width = `${innerWidth}px`
+        canvas.style.height = `${innerHeight}px`
+        ctx = offscreenCanvas.value.getContext('2d')
     } else {
         // 浏览器不支持OffscreenCanvas，使用常规canvas
         canvas.width = innerWidth * dpr
