@@ -107,10 +107,10 @@ watch(showNextSection, (value) => {
 
 // 初始化用户交互监听
 onMounted(() => {
-    // 添加全局事件监听，等待用户交互后启动音乐
+    // 添加全局事件监听,等待用户交互后启动音乐
     document.addEventListener('click', handleUserInteraction, { once: false })
     document.addEventListener('keydown', handleUserInteraction, { once: false })
-    document.addEventListener('touchstart', handleUserInteraction, { once: false })
+    document.addEventListener('mousestart', handleUserInteraction, { once: false })
 })
 
 onBeforeUnmount(() => {
@@ -125,6 +125,7 @@ onBeforeUnmount(() => {
     document.removeEventListener('click', handleUserInteraction)
     document.removeEventListener('keydown', handleUserInteraction)
     document.removeEventListener('touchstart', handleUserInteraction)
+    document.removeEventListener('mousestart', handleUserInteraction)
 })
 </script>
 
@@ -230,7 +231,7 @@ onBeforeUnmount(() => {
 /* 音乐提示样式 */
 .music-hint {
     position: fixed;
-    bottom: 40px;
+    bottom: 64px;
     left: 50%;
     transform: translateX(-50%);
     z-index: 60;
