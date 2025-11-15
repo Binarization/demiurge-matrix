@@ -233,7 +233,7 @@ onBeforeUnmount(() => {
     bottom: 40px;
     left: 50%;
     transform: translateX(-50%);
-    z-index: 40;
+    z-index: 60;
     pointer-events: none;
 }
 
