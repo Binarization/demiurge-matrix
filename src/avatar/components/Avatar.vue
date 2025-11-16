@@ -165,8 +165,9 @@ let skysphere: THREE.Mesh | null = null
 let isPaused = false // 是否暂停渲染
 
 // 背景渲染相关
-const INITIAL_RENDER_FRAME_COUNT = 90 // 初始强制渲染帧数
-const LOW_PERFORMANCE_FPS_THRESHOLD = 30
+const INITIAL_RENDER_FRAME_COUNT = 60 // 初始强制渲染帧数
+const LOW_PERFORMANCE_FPS_THRESHOLD = 50
+const LOW_PERFORMANCE_FPS_COUNTER_THRESHOLD = 5
 const LOW_RESOLUTION_SCALE_FACTOR = 0.25
 let backgroundScene: THREE.Scene | null = null // 背景场景（GaussianSplat + 天空球）
 let vrmScene: THREE.Scene | null = null // VRM 场景
@@ -176,6 +177,7 @@ let needUpdateBackground = true // 是否需要更新背景
 let initialRenderFrames = 0 // 初始渲染帧数计数器
 let gaussianSplatReady = false // GaussianSplat3D 是否已准备好（从 viewer.viewer.splatRenderReady 同步）
 let lowResolutionMode = false // 是否处于低分辨率模式
+let lowPerformanceFpsCounter = 0 // 低性能 FPS 计数器
 
 // VRM 引用
 let vrmModel: any = null
@@ -373,7 +375,7 @@ const clock = new THREE.Clock()
 clock.start()
 
 // FPS 计算
-const fpsUpdateInterval = 0.25
+const fpsUpdateInterval = 1
 let frameCount = 0
 let fpsUpdateTime = 0
 
@@ -475,22 +477,26 @@ function createRenderTarget(w: number, h: number) {
 
 function checkLowFPS(currentFps: number) {
     // 在高斯泼溅渲染阶段过半后再检测低帧率
-    if (initialRenderFrames > (INITIAL_RENDER_FRAME_COUNT - 20) && !lowResolutionMode && currentFps < LOW_PERFORMANCE_FPS_THRESHOLD) {
-        // 切换到低分辨率模式
-        lowResolutionMode = true
-        setLowResolutionRenderTarget()
-        initialRenderFrames = 0 // 重置初始渲染帧数计数器
-        console.log('[Avatar] Low FPS detected: ', currentFps)
+    if (initialRenderFrames >= INITIAL_RENDER_FRAME_COUNT && !lowResolutionMode && currentFps < LOW_PERFORMANCE_FPS_THRESHOLD) {
+        lowPerformanceFpsCounter++
 
-        // 记录设备低性能标记
-        try {
-            const rendererInfo = getRendererInfo()
+        if (lowPerformanceFpsCounter >= LOW_PERFORMANCE_FPS_COUNTER_THRESHOLD) {
+            // 切换到低分辨率模式
+            lowResolutionMode = true
+            setLowResolutionRenderTarget()
+            initialRenderFrames = 0 // 重置初始渲染帧数计数器
+            console.log('[Avatar] Low FPS detected: ', currentFps)
 
-            if (rendererInfo) {
-                localStorage.setItem('low_performance_device', rendererInfo)
+            // 记录设备低性能标记
+            try {
+                const rendererInfo = getRendererInfo()
+
+                if (rendererInfo) {
+                    localStorage.setItem('low_performance_device', rendererInfo)
+                }
+            } catch (e) {
+                // ignore localStorage errors (e.g. private mode)
             }
-        } catch (e) {
-            // ignore localStorage errors (e.g. private mode)
         }
     }
 }

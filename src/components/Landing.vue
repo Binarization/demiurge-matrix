@@ -918,7 +918,7 @@ onUnmounted(() => {
 .progress-label {
     position: fixed;
     left: 21px;
-    bottom: 7px;
+    bottom: 6px;
     font-size: 128px;
     font-family: 'Ark Pixel', 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
     font-weight: 300;
@@ -942,7 +942,7 @@ onUnmounted(() => {
 .init-label {
     position: fixed;
     top: 5px;
-    right: 2px;
+    right: 0px;
     font-size: 108px;
     font-family: 'Ark Pixel', 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
     font-weight: 300;
