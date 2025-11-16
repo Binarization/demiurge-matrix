@@ -363,7 +363,7 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
 })
 
 // 添加预加载资源
-preloader.add(new PreloadResource('/fonts/ark_pixel.ttf', 'font'))
+preloader.add(new PreloadResource('/fonts/ark-pixel-12px-monospaced-zh_cn.ttf.woff2', 'font'))
 preloader.add(new PreloadResource(props.modelUrl, 'model'))
 preloader.add(new PreloadResource(props.animationUrl, 'idle_animation'))
 preloader.add(new PreloadResource(props.splatScenePath, 'splat_scene'))
