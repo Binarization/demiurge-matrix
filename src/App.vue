@@ -73,14 +73,15 @@ const handleUserInteraction = async () => {
         }
     } catch (error) {
         console.warn('Failed to start background music:', error)
+        hasUserInteracted.value = false
+        return
     }
     
     // 移除事件监听
     document.removeEventListener('click', handleUserInteraction)
-    document.removeEventListener('wheel', handleUserInteraction)
     document.removeEventListener('keydown', handleUserInteraction)
-    document.removeEventListener('touchstart', handleUserInteraction)
     document.removeEventListener('mousestart', handleUserInteraction)
+    document.removeEventListener('touchend', handleUserInteraction)
 }
 
 // 监听 showNextSection 变化，当 Landing 消失时恢复 Avatar 渲染
@@ -96,8 +97,8 @@ onMounted(() => {
     // 添加全局事件监听,等待用户交互后启动音乐
     document.addEventListener('click', handleUserInteraction, { once: false })
     document.addEventListener('keydown', handleUserInteraction, { once: false })
-    document.addEventListener('touchstart', handleUserInteraction, { once: false })
     document.addEventListener('mousestart', handleUserInteraction, { once: false })
+    document.addEventListener('touchend', handleUserInteraction, { once: false })
 })
 
 onBeforeUnmount(() => {
@@ -109,8 +110,8 @@ onBeforeUnmount(() => {
     // 移除事件监听（如果还未触发）
     document.removeEventListener('click', handleUserInteraction)
     document.removeEventListener('keydown', handleUserInteraction)
-    document.removeEventListener('touchstart', handleUserInteraction)
     document.removeEventListener('mousestart', handleUserInteraction)
+    document.removeEventListener('touchend', handleUserInteraction)
 })
 </script>
 

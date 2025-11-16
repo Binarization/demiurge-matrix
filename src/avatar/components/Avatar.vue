@@ -165,14 +165,17 @@ let skysphere: THREE.Mesh | null = null
 let isPaused = false // 是否暂停渲染
 
 // 背景渲染相关
+const INITIAL_RENDER_FRAME_COUNT = 60 // 初始强制渲染帧数
+const LOW_PERFORMANCE_FPS_THRESHOLD = 30
+const LOW_RESOLUTION_SCALE_FACTOR = 0.25
 let backgroundScene: THREE.Scene | null = null // 背景场景（GaussianSplat + 天空球）
 let vrmScene: THREE.Scene | null = null // VRM 场景
 let backgroundRenderTarget: THREE.WebGLRenderTarget | null = null // 背景渲染目标
 let backgroundPlane: THREE.Mesh | null = null // 用于显示背景纹理的平面
 let needUpdateBackground = true // 是否需要更新背景
 let initialRenderFrames = 0 // 初始渲染帧数计数器
-const INITIAL_RENDER_FRAME_COUNT = 60 // 初始强制渲染帧数（约1秒）
 let gaussianSplatReady = false // GaussianSplat3D 是否已准备好（从 viewer.viewer.splatRenderReady 同步）
+let lowResolutionMode = false // 是否处于低分辨率模式
 
 // VRM 引用
 let vrmModel: any = null
@@ -378,6 +381,61 @@ function updateVRMTransform() {
 }
 
 /**
+ * 低性能优化
+ */
+
+function createRenderTarget(w: number, h: number) {
+    return new THREE.WebGLRenderTarget(
+        w,
+        h,
+        {
+            minFilter: THREE.LinearFilter,
+            magFilter: THREE.LinearFilter,
+            format: THREE.RGBAFormat,
+        }
+    )
+}
+
+function checkLowFPS(currentFps: number) {
+    // 在高斯泼溅渲染阶段过半后再检测低帧率
+    if (initialRenderFrames > (INITIAL_RENDER_FRAME_COUNT - 10) && !lowResolutionMode && currentFps < LOW_PERFORMANCE_FPS_THRESHOLD) {
+        // 切换到低分辨率模式
+        lowResolutionMode = true
+        setLowResolutionRenderTarget()
+        initialRenderFrames = 0 // 重置初始渲染帧数计数器
+        console.log('[Avatar] Low FPS detected: ', currentFps)
+    }
+}
+
+const updateBackgroundTexture = () => {
+    if (!backgroundPlane || !backgroundRenderTarget) {
+        return
+    }
+
+    const material = backgroundPlane.material as THREE.ShaderMaterial | undefined
+
+    if (material && material.uniforms?.tBackground) {
+        material.uniforms.tBackground.value = backgroundRenderTarget.texture
+        material.uniformsNeedUpdate = true
+        needUpdateBackground = true
+    }
+}
+
+function setLowResolutionRenderTarget() {
+    if (!renderer) return
+
+    const w = Math.floor(window.innerWidth * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR)
+    const h = Math.floor(window.innerHeight * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR)
+
+    if (backgroundRenderTarget) {
+        backgroundRenderTarget.dispose()
+    }
+
+    backgroundRenderTarget = createRenderTarget(w, h)
+    updateBackgroundTexture()
+}
+
+/**
  * 动画循环
  */
 function animate() {
@@ -392,18 +450,19 @@ function animate() {
         // 只有在渲染时才获取 delta，这样暂停期间不会累积时间
         const delta = clock.getDelta()
 
-        // 更新 FPS（在这里计算整体渲染帧率）
-        if (props.showFps) {
-            frameCount++
-            fpsUpdateTime += delta
-            if (fpsUpdateTime >= 1) {
-                fps.value = Math.ceil(frameCount / fpsUpdateTime)
-                frameCount = 0
-                fpsUpdateTime -= 1 // 保留超出1秒的部分，保持计算连续性
-            }
+        // 更新 FPS
+        frameCount++
+        fpsUpdateTime += delta
+        if (fpsUpdateTime >= 1) {
+            fps.value = Math.ceil(frameCount / fpsUpdateTime)
+            frameCount = 0
+            fpsUpdateTime -= 1 // 保留超出1秒的部分，保持计算连续性
+
+            // 性能检测
+            checkLowFPS(fps.value)
         }
 
-                // 更新控制器（动画期间跳过，避免控制器干扰相机位置）
+        // 更新控制器（动画期间跳过，避免控制器干扰相机位置）
         if (controls && !isCameraAnimating) {
             controls.update()
         }
@@ -465,10 +524,17 @@ function onWindowResize() {
         renderer.setSize(width, height)
 
         // 更新 RenderTarget 尺寸
-        backgroundRenderTarget.setSize(
-            width * window.devicePixelRatio,
-            height * window.devicePixelRatio
-        )
+        if (lowResolutionMode) {
+            backgroundRenderTarget.setSize(
+                Math.floor(width * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR),
+                Math.floor(height * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR)
+            )
+        } else {
+            backgroundRenderTarget.setSize(
+                width * window.devicePixelRatio,
+                height * window.devicePixelRatio
+            )
+        }
 
         // 标记需要更新背景
         needUpdateBackground = true
@@ -533,14 +599,9 @@ onMounted(async () => {
         renderer.setPixelRatio(window.devicePixelRatio)
 
         // 2. 创建 RenderTarget 用于背景渲染
-        backgroundRenderTarget = new THREE.WebGLRenderTarget(
+        backgroundRenderTarget = createRenderTarget(
             width * window.devicePixelRatio,
-            height * window.devicePixelRatio,
-            {
-                minFilter: THREE.LinearFilter,
-                magFilter: THREE.LinearFilter,
-                format: THREE.RGBAFormat,
-            }
+            height * window.devicePixelRatio
         )
 
         // 3. 创建背景场景（GaussianSplat + 天空球）
@@ -651,6 +712,7 @@ onMounted(async () => {
         backgroundPlane.renderOrder = -1000 // 最先渲染
         backgroundPlane.frustumCulled = false
         vrmScene.add(backgroundPlane)
+        updateBackgroundTexture()
 
         // 添加环境光到 VRM 场景
         const vrmAmbientLight = new THREE.AmbientLight(0xffffff, 4)
@@ -1034,7 +1096,7 @@ defineExpose({
 <template>
     <div ref="main" class="avatar-container">
         <canvas ref="canvas" class="avatar-canvas"></canvas>
-        <span v-if="showFps" class="fps">FPS: {{ fps }}</span>
+        <span v-if="props.showFps" class="fps">FPS: {{ fps }}</span>
         <div v-if="errorMessage" class="error">{{ errorMessage }}</div>
     </div>
 </template>
