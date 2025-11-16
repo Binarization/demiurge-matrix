@@ -133,9 +133,11 @@ const currentInitWord = computed(() => {
     if (!initWords.length) {
         return ''
     }
+    // 0~90% 显示进度，90~100%保持最后一个词
+    const progress = Math.min(loadProgress.value, 90)
     const index = Math.min(
         initWords.length - 1,
-        Math.floor((loadProgress.value / 100) * initWords.length)
+        Math.floor((progress / 90) * initWords.length)
     )
     return initWords[index]!
 })
@@ -182,15 +184,16 @@ const updateScrambledWord = () => {
         return
     }
 
-    if (loadProgress.value >= 100) {
+    // 0~90% 显示进度，90~100%保持最后一个词
+    if (loadProgress.value >= 90) {
         scrambledInitWord.value = initWords[totalWords - 1]!
         lastScrambleStage = 'complete'
         lastScrambleIndex = totalWords - 1
         return
     }
 
-    const segmentSize = 100 / totalWords
-    const progress = Math.max(0, Math.min(loadProgress.value, 99.999))
+    const segmentSize = 90 / totalWords
+    const progress = Math.max(0, Math.min(loadProgress.value, 89.999))
     const currentIndex = Math.min(totalWords - 1, Math.floor(progress / segmentSize))
     const currentWord = initWords[currentIndex] ?? ''
     const previousWord = currentIndex > 0 ? initWords[currentIndex - 1]! : currentWord
@@ -914,9 +917,9 @@ onUnmounted(() => {
 
 .progress-label {
     position: fixed;
-    left: 16px;
-    bottom: 4px;
-    font-size: clamp(3rem, 10vw, 10rem);
+    left: 21px;
+    bottom: 7px;
+    font-size: 128px;
     font-family: 'Ark Pixel', 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
     font-weight: 300;
     line-height: 0.7;
@@ -938,9 +941,9 @@ onUnmounted(() => {
 
 .init-label {
     position: fixed;
-    top: 4px;
-    right: 4px;
-    font-size: clamp(2.5rem, 8vw, 9rem);
+    top: 5px;
+    right: 2px;
+    font-size: 108px;
     font-family: 'Ark Pixel', 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
     font-weight: 300;
     line-height: 0.8;
@@ -959,21 +962,6 @@ onUnmounted(() => {
     display: inline-block;
     padding-top: 0.1em;
     letter-spacing: 0.04em;
-}
-
-@media (max-width: 600px) {
-    .progress-label {
-        left: 16px;
-        bottom: 2px;
-        font-size: clamp(2.3rem, 14vw, 6rem);
-        line-height: 0.9;
-    }
-    .init-label {
-        top: 2px;
-        right: 8px;
-        font-size: clamp(1.6rem, 10vw, 5rem);
-        line-height: 1.1;
-    }
 }
 
 .explosion-overlay {
@@ -1052,6 +1040,45 @@ onUnmounted(() => {
         opacity: 1;
         transform: translate(-50%, -50%) rotate(45deg) scale(20);
         box-shadow: 0 0 120px rgba(255, 255, 255, 1);
+    }
+}
+
+/* Mobile Styles */
+@media (max-width: 767px) {
+    .progress-label {
+        left: 24px;
+        bottom: 6px;
+        font-size: 82px;
+        line-height: 0.9;
+    }
+
+    .init-label {
+        top: 3px;
+        right: 12px;
+        font-size: 54px;
+        line-height: 1.1;
+    }
+
+    @keyframes explosion-grow {
+        0% {
+            opacity: 1;
+            transform: translate(-50%, -50%) rotate(45deg) scale(0.2);
+            box-shadow:
+                0 0 20px rgba(255, 255, 255, 0.8),
+                0 0 80px rgba(255, 255, 255, 0.5);
+        }
+        50% {
+            opacity: 1;
+            transform: translate(-50%, -50%) rotate(45deg) scale(1);
+            box-shadow:
+                0 0 60px rgba(255, 255, 255, 0.95),
+                0 0 160px rgba(255, 255, 255, 0.65);
+        }
+        100% {
+            opacity: 1;
+            transform: translate(-50%, -50%) rotate(45deg) scale(20);
+            box-shadow: 0 0 120px rgba(255, 255, 255, 1);
+        }
     }
 }
 </style>
