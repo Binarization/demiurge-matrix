@@ -20,7 +20,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { VRMUtils } from '@pixiv/three-vrm'
 import { VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation'
 import { VRMLookAtSmootherLoaderPlugin } from '@/avatar/libs/VRMLookAtSmootherLoaderPlugin/VRMLookAtSmootherLoaderPlugin'
-import { PreloaderWithWorker as Preloader, PreloadResource, PreloaderEvent } from '@/avatar/utils/Preloader'
+import { Preloader, PreloadResource, PreloaderEvent } from '@/avatar/utils/Preloader'
 import { VrmController } from '@/avatar/utils/VrmController'
 // @ts-ignore - GaussianSplats3D doesn't have type definitions
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d'
@@ -283,7 +283,8 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
     emit('vrmLoaded', modelVrm)
 })
 
-// 添加VRM资源
+// 添加预加载资源
+preloader.add(new PreloadResource('/fonts/ark_pixel.ttf', 'font'))
 preloader.add(new PreloadResource(props.modelUrl, 'model'))
 preloader.add(new PreloadResource(props.animationUrl, 'idle_animation'))
 preloader.add(new PreloadResource(props.splatScenePath, 'splat_scene'))

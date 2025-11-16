@@ -86,7 +86,7 @@ export class PreloadResource {
     }
 }
 
-export class PreloaderWithWorker {
+export class Preloader {
     private resources: PreloadResource[]
     private resourcesMap: Map<string, number>
     private status: string

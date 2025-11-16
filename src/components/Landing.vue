@@ -126,7 +126,7 @@ const explosionStage = ref<'idle' | 'expanding' | 'complete'>('idle')
 let explosionTimeout: number | undefined
 
 const progressDisplay = computed(() => `${Math.round(loadProgress.value)}%`)
-const initWords = ['初始化', '桃子', '温柔', '迷迷', '昔涟', '德谬歌', '你好', '世界', '明天见']
+const initWords = ['初始化', '桃子', '爱', '迷迷', '昔涟', '德谬歌', '你好', '世界', '明天见']
 const scrambleChars = '!@#$%^&*()_+-=[]{}<>?/\\|'
 const scrambledInitWord = ref(initWords[0] ?? '')
 const currentInitWord = computed(() => {
@@ -268,10 +268,13 @@ watch(loadProgress, value => {
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t
 
 const buildPath = (width: number, height: number) => {
+    const margin = Math.max(96, width * 0.12)
+    const availableWidth = width - margin * 2
+    const availableHeight = height - margin * 2
+    const scaleY = Math.min(availableWidth, availableHeight) * 0.5
+    const scaleX = scaleY * 1.1
     const centerX = width / 2
     const centerY = height / 2
-    const scaleX = width * 0.35
-    const scaleY = height * 0.5
     const points: PathPoint[] = new Array(PATH_SEGMENTS).fill(0).map((_, index) => {
         const t = (index / PATH_SEGMENTS) * Math.PI * 2
         const sinT = Math.sin(t)
@@ -863,14 +866,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-:global(html, body, #app) {
-    height: 100%;
-    width: 100%;
-    margin: 0;
-    padding: 0;
-    background: #000;
-}
-
 .app-shell {
     position: fixed;
     inset: 0;
@@ -916,40 +911,69 @@ onUnmounted(() => {
     pointer-events: none;
 }
 
+
 .progress-label {
     position: fixed;
-    left: 2px;
-    bottom: 2px;
-    font-size: 10rem;
-    font-family: 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
+    left: 16px;
+    bottom: 4px;
+    font-size: clamp(3rem, 10vw, 10rem);
+    font-family: 'Ark Pixel', 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
     font-weight: 300;
-    line-height: 0.5;
+    line-height: 0.7;
     color: #fff;
     mix-blend-mode: difference;
     pointer-events: none;
+    text-shadow:
+        0 2px 8px rgba(0,0,0,0.18),
+        0 0 2px #fff;
+    user-select: none;
+    z-index: 100;
 }
 
 .progress-label span {
     display: inline-block;
     padding-bottom: 0.1em;
+    letter-spacing: 0.04em;
 }
 
 .init-label {
     position: fixed;
-    top: 2px;
-    right: 2px;
-    font-size: 9rem;
-    font-family: 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
+    top: 4px;
+    right: 4px;
+    font-size: clamp(2.5rem, 8vw, 9rem);
+    font-family: 'Ark Pixel', 'Space Grotesk', 'Inter', 'Segoe UI', sans-serif;
     font-weight: 300;
-    line-height: 0.65;
+    line-height: 0.8;
     color: #fff;
     mix-blend-mode: difference;
     pointer-events: none;
+    text-shadow:
+        0 2px 8px rgba(0,0,0,0.18),
+        0 0 2px #fff;
+    user-select: none;
+    z-index: 100;
+    text-align: right;
 }
 
 .init-label span {
     display: inline-block;
     padding-top: 0.1em;
+    letter-spacing: 0.04em;
+}
+
+@media (max-width: 600px) {
+    .progress-label {
+        left: 16px;
+        bottom: 2px;
+        font-size: clamp(2.3rem, 14vw, 6rem);
+        line-height: 0.9;
+    }
+    .init-label {
+        top: 2px;
+        right: 8px;
+        font-size: clamp(1.6rem, 10vw, 5rem);
+        line-height: 1.1;
+    }
 }
 
 .explosion-overlay {
@@ -999,6 +1023,14 @@ onUnmounted(() => {
 
 .explosion-overlay--active .explosion-square {
     animation: explosion-grow 1.2s cubic-bezier(0.19, 1, 0.22, 1) forwards;
+}
+
+@font-face {
+     font-family: 'Ark Pixel';
+     src: url('/fonts/ark-pixel-12px-monospaced-zh_cn.ttf.woff2') format('woff2');
+     font-weight: normal;
+     font-style: normal;
+     font-display: swap;
 }
 
 @keyframes explosion-grow {
