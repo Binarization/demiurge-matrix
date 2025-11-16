@@ -65,12 +65,10 @@ const handleUserInteraction = async () => {
     try {
         // 根据当前阶段选择播放的音乐
         if (isInCore.value) {
-            // 如果已经在 Core 阶段，直接播放 homeland
             await bgMusic.load('/audios/homeland.mp3')
             await bgMusic.fadeIn(2000)
         } else {
-            // 如果还在 Landing 阶段，播放 zai_du_yu_ni
-            await bgMusic.load('/audios/zai_du_yu_ni.flac')
+            await bgMusic.load('/audios/zai_du_he_ni.flac')
             await bgMusic.fadeIn(2000)
         }
     } catch (error) {
@@ -79,8 +77,10 @@ const handleUserInteraction = async () => {
     
     // 移除事件监听
     document.removeEventListener('click', handleUserInteraction)
+    document.removeEventListener('wheel', handleUserInteraction)
     document.removeEventListener('keydown', handleUserInteraction)
     document.removeEventListener('touchstart', handleUserInteraction)
+    document.removeEventListener('mousestart', handleUserInteraction)
 }
 
 // 监听 showNextSection 变化，当 Landing 消失时恢复 Avatar 渲染
@@ -96,6 +96,7 @@ onMounted(() => {
     // 添加全局事件监听,等待用户交互后启动音乐
     document.addEventListener('click', handleUserInteraction, { once: false })
     document.addEventListener('keydown', handleUserInteraction, { once: false })
+    document.addEventListener('touchstart', handleUserInteraction, { once: false })
     document.addEventListener('mousestart', handleUserInteraction, { once: false })
 })
 
