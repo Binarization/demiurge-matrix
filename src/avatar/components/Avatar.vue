@@ -735,14 +735,17 @@ onMounted(async () => {
                 // 获取预加载的 splat 数据
                 const splatResource = resources.getByName('splat_scene')
                 const splatData = splatResource.getData()
-                const splatUrl = splatResource.getUrl()
 
-                // 使用预加载的数据加载场景
+                // 将 ArrayBuffer 转为 Blob，然后创建 blob URL
+                const blob = new Blob([splatData], { type: 'application/octet-stream' })
+                const blobUrl = URL.createObjectURL(blob)
+
+                // 使用 blob URL 加载场景，显式指定格式（.splat）
                 await viewer.addSplatScenes(
                     [
                         {
-                            data: splatData, // 使用预加载的 ArrayBuffer
-                            path: splatUrl, // 提供原始路径用于文件类型检测
+                            path: blobUrl,
+                            format: GaussianSplats3D.SceneFormat.Splat, // 显式指定格式
                             splatAlphaRemovalThreshold: props.splatAlphaRemovalThreshold,
                             scale: props.splatScale,
                             position: props.splatPosition,
@@ -750,6 +753,9 @@ onMounted(async () => {
                     ],
                     false // 设置为 false 禁用 GaussianSplats3D 的内置加载UI
                 )
+
+                // 使用完 blob URL 后释放
+                URL.revokeObjectURL(blobUrl)
 
                 // 将viewer添加到背景场景中
                 if (backgroundScene) {
