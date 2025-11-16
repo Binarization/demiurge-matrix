@@ -234,6 +234,7 @@ onMounted(() => {
     window.addEventListener('pointermove', handlePointerMove, { passive: true })
     window.addEventListener('pointerleave', handlePointerLeave)
     window.addEventListener('touchend', handleTouchEnd)
+    window.addEventListener('mouseout', handlePointerLeave)
     state.rafId = window.requestAnimationFrame(animate)
 })
 
@@ -243,6 +244,7 @@ onUnmounted(() => {
     window.removeEventListener('pointermove', handlePointerMove)
     window.removeEventListener('pointerleave', handlePointerLeave)
     window.removeEventListener('touchend', handleTouchEnd)
+    window.removeEventListener('mouseout', handlePointerLeave)
 })
 </script>
 
