@@ -922,13 +922,25 @@ onMounted(async () => {
 
         // 9. 使用 DropInViewer 方式创建 GaussianSplats3D Viewer
         viewer = new GaussianSplats3D.DropInViewer({
-            sharedMemoryForWorkers: false,
+            // Worker 配置
+            sharedMemoryForWorkers: false, // 不使用 SharedArrayBuffer（避免安全限制）
+            
+            // 渲染质量优化
             sphericalHarmonicsDegree: 0,
-            // 使用 Always 模式确保初始渲染完整
-            // 我们通过只在相机移动时更新 RenderTarget 来控制性能
-            renderMode: GaussianSplats3D.RenderMode.Always,
-            // 使用 Instant 模式禁用渐进式加载，确保场景立即完整显示
-            sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
+            halfPrecisionCovariancesOnGPU: true, // 使用半精度浮点（减少 GPU 内存和带宽）
+            
+            // 排序优化
+            integerBasedSort: true, // 使用整数排序
+            
+            // 场景优化
+            dynamicScene: false,
+            
+            // 加载模式
+            renderMode: GaussianSplats3D.RenderMode.Always, // 确保初始渲染完整
+            sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant, // 场景立即显示
+
+            // 启用 SIMD 指令加速排序
+            enableSIMDInSort: true,
         })
 
         // 监听窗口变化
