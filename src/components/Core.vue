@@ -21,6 +21,113 @@ type ChatMessage = {
     text: string
 }
 
+const VOICE_KEYWORDS = ['昔涟', '翁法罗斯', '哀丽秘榭', '黄金裔', '往昔的涟漪', '德谬歌']
+const MISHEARD_KEYWORD_MAP: Record<string, string> = {
+    西莲: '昔涟',
+    西连: '昔涟',
+    西联: '昔涟',
+    希莲: '昔涟',
+    艾力密切: '哀丽秘榭',
+    艾丽密榭: '哀丽秘榭',
+    埃利密榭: '哀丽秘榭',
+    艾力秘切: '哀丽秘榭',
+}
+
+// 常见拼音近似，用字母匹配兜底
+const PINYIN_KEYWORD_MAP: Record<string, string> = {
+    xilian: '昔涟',
+    wengfaluosi: '翁法罗斯',
+    ailimixie: '哀丽秘榭',
+    ailimiqie: '哀丽秘榭',
+    huangjinyi: '黄金裔',
+    wangxidelianyi: '往昔的涟漪',
+    demiuge: '德谬歌',
+}
+
+const sanitizeToPinyinKey = (input: string): string => {
+    return input
+        .normalize('NFD')
+        .replace(/\p{Diacritic}/gu, '')
+        .toLowerCase()
+        .replace(/[^a-z]/g, '')
+}
+
+const replaceCommonMisheardWords = (input: string): string => {
+    return Object.entries(MISHEARD_KEYWORD_MAP).reduce((text, [wrong, right]) => {
+        return text.includes(wrong) ? text.split(wrong).join(right) : text
+    }, input)
+}
+
+const levenshteinDistance = (a: string, b: string): number => {
+    const dp: number[][] = Array.from({ length: a.length + 1 }, () =>
+        new Array(b.length + 1).fill(0)
+    )
+
+    for (let i = 0; i <= a.length; i += 1) {
+        dp[i]![0] = i
+    }
+    for (let j = 0; j <= b.length; j += 1) {
+        dp[0]![j] = j
+    }
+
+    for (let i = 1; i <= a.length; i += 1) {
+        for (let j = 1; j <= b.length; j += 1) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1
+            dp[i]![j] = Math.min(
+                dp[i - 1]![j]! + 1,
+                dp[i]![j - 1]! + 1,
+                dp[i - 1]![j - 1]! + cost
+            )
+        }
+    }
+
+    return dp[a.length]![b.length]!
+}
+
+const applyKeywordCorrections = (input: string): string => {
+    let output = replaceCommonMisheardWords(input)
+
+    VOICE_KEYWORDS.forEach(keyword => {
+        if (output.includes(keyword)) {
+            return
+        }
+
+        const len = keyword.length
+        const windowSize = len + 2 // allow slight length variation
+        let bestStart = -1
+        let bestEnd = -1
+        let bestDistance = Number.POSITIVE_INFINITY
+
+        for (let start = 0; start <= Math.max(0, output.length - len); start += 1) {
+            const segment = output.slice(start, start + windowSize)
+            if (!segment) continue
+
+            const distance = levenshteinDistance(segment, keyword)
+            if (distance < bestDistance) {
+                bestDistance = distance
+                bestStart = start
+                bestEnd = start + segment.length
+            }
+        }
+
+        const threshold = Math.max(1, Math.ceil(len * 0.4))
+        if (bestStart >= 0 && bestDistance <= threshold) {
+            output = `${output.slice(0, bestStart)}${keyword}${output.slice(bestEnd)}`
+        }
+    })
+
+    // 拼音兜底：当语音返回的是拼音或近似拼音时，强制替换
+    const pinyinKey = sanitizeToPinyinKey(output)
+    Object.entries(PINYIN_KEYWORD_MAP).forEach(([key, target]) => {
+        if (!pinyinKey.includes(key)) return
+        if (!output.includes(target)) {
+            output = `${output} ${target}`.trim()
+        }
+    })
+
+    return output
+}
+
 const isChatOpen = ref(false)
 const pendingMessage = ref('')
 const chatMessagesRef = ref<HTMLDivElement | null>(null)
@@ -238,10 +345,18 @@ onMounted(() => {
     }
 
     const SpeechRecognitionClass =
-        (window as typeof window & { SpeechRecognition?: any; webkitSpeechRecognition?: any })
-            .SpeechRecognition ||
-        (window as typeof window & { SpeechRecognition?: any; webkitSpeechRecognition?: any })
-            .webkitSpeechRecognition
+        (window as typeof window & {
+            SpeechRecognition?: any
+            webkitSpeechRecognition?: any
+            SpeechGrammarList?: any
+            webkitSpeechGrammarList?: any
+        }).SpeechRecognition ||
+        (window as typeof window & {
+            SpeechRecognition?: any
+            webkitSpeechRecognition?: any
+            SpeechGrammarList?: any
+            webkitSpeechGrammarList?: any
+        }).webkitSpeechRecognition
 
     if (!SpeechRecognitionClass) {
         voiceSupported.value = false
@@ -250,7 +365,20 @@ onMounted(() => {
     }
 
     speechRecognition = new SpeechRecognitionClass()
+    const SpeechGrammarListClass =
+        (window as typeof window & { SpeechGrammarList?: any; webkitSpeechGrammarList?: any })
+            .SpeechGrammarList ||
+        (window as typeof window & { SpeechGrammarList?: any; webkitSpeechGrammarList?: any })
+            .webkitSpeechGrammarList
+
+    if (SpeechGrammarListClass) {
+        const grammarList = new SpeechGrammarListClass()
+        const grammar = `#JSGF V1.0; grammar keywords; public <keyword> = ${VOICE_KEYWORDS.join(' | ')};`
+        grammarList.addFromString(grammar, 1)
+        speechRecognition.grammars = grammarList
+    }
     speechRecognition.lang = 'zh-CN'
+    speechRecognition.maxAlternatives = 5
     speechRecognition.continuous = false
     speechRecognition.interimResults = true
 
@@ -283,7 +411,7 @@ onMounted(() => {
             .trim()
 
         if (transcript) {
-            pendingMessage.value = transcript
+            pendingMessage.value = applyKeywordCorrections(transcript)
             voiceCapturedText = true
         }
     }
