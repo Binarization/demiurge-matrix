@@ -1,9 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
-import IconSend from '~icons/mdi/send'
 import IconCog from '~icons/mdi/cog'
-import IconMicrophone from '~icons/mdi/microphone'
 import { Agent } from '@/lib/agent'
 import { loadStoredOpenRouterConfig, saveStoredOpenRouterConfig } from '@/lib/openrouter-config'
 import Avatar from '@/avatar/components/Avatar.vue'
@@ -21,132 +19,18 @@ type ChatMessage = {
     text: string
 }
 
-const VOICE_KEYWORDS = ['昔涟', '翁法罗斯', '哀丽秘榭', '黄金裔', '往昔的涟漪', '德谬歌']
-const MISHEARD_KEYWORD_MAP: Record<string, string> = {
-    西莲: '昔涟',
-    西连: '昔涟',
-    西联: '昔涟',
-    希莲: '昔涟',
-    艾力密切: '哀丽秘榭',
-    艾丽密榭: '哀丽秘榭',
-    埃利密榭: '哀丽秘榭',
-    艾力秘切: '哀丽秘榭',
-}
-
-// 常见拼音近似，用字母匹配兜底
-const PINYIN_KEYWORD_MAP: Record<string, string> = {
-    xilian: '昔涟',
-    wengfaluosi: '翁法罗斯',
-    ailimixie: '哀丽秘榭',
-    ailimiqie: '哀丽秘榭',
-    huangjinyi: '黄金裔',
-    wangxidelianyi: '往昔的涟漪',
-    demiuge: '德谬歌',
-}
-
-const sanitizeToPinyinKey = (input: string): string => {
-    return input
-        .normalize('NFD')
-        .replace(/\p{Diacritic}/gu, '')
-        .toLowerCase()
-        .replace(/[^a-z]/g, '')
-}
-
-const replaceCommonMisheardWords = (input: string): string => {
-    return Object.entries(MISHEARD_KEYWORD_MAP).reduce((text, [wrong, right]) => {
-        return text.includes(wrong) ? text.split(wrong).join(right) : text
-    }, input)
-}
-
-const levenshteinDistance = (a: string, b: string): number => {
-    const dp: number[][] = Array.from({ length: a.length + 1 }, () =>
-        new Array(b.length + 1).fill(0)
-    )
-
-    for (let i = 0; i <= a.length; i += 1) {
-        dp[i]![0] = i
-    }
-    for (let j = 0; j <= b.length; j += 1) {
-        dp[0]![j] = j
-    }
-
-    for (let i = 1; i <= a.length; i += 1) {
-        for (let j = 1; j <= b.length; j += 1) {
-            const cost = a[i - 1] === b[j - 1] ? 0 : 1
-            dp[i]![j] = Math.min(
-                dp[i - 1]![j]! + 1,
-                dp[i]![j - 1]! + 1,
-                dp[i - 1]![j - 1]! + cost
-            )
-        }
-    }
-
-    return dp[a.length]![b.length]!
-}
-
-const applyKeywordCorrections = (input: string): string => {
-    let output = replaceCommonMisheardWords(input)
-
-    VOICE_KEYWORDS.forEach(keyword => {
-        if (output.includes(keyword)) {
-            return
-        }
-
-        const len = keyword.length
-        const windowSize = len + 2 // allow slight length variation
-        let bestStart = -1
-        let bestEnd = -1
-        let bestDistance = Number.POSITIVE_INFINITY
-
-        for (let start = 0; start <= Math.max(0, output.length - len); start += 1) {
-            const segment = output.slice(start, start + windowSize)
-            if (!segment) continue
-
-            const distance = levenshteinDistance(segment, keyword)
-            if (distance < bestDistance) {
-                bestDistance = distance
-                bestStart = start
-                bestEnd = start + segment.length
-            }
-        }
-
-        const threshold = Math.max(1, Math.ceil(len * 0.4))
-        if (bestStart >= 0 && bestDistance <= threshold) {
-            output = `${output.slice(0, bestStart)}${keyword}${output.slice(bestEnd)}`
-        }
-    })
-
-    // 拼音兜底：当语音返回的是拼音或近似拼音时，强制替换
-    const pinyinKey = sanitizeToPinyinKey(output)
-    Object.entries(PINYIN_KEYWORD_MAP).forEach(([key, target]) => {
-        if (!pinyinKey.includes(key)) return
-        if (!output.includes(target)) {
-            output = `${output} ${target}`.trim()
-        }
-    })
-
-    return output
-}
-
 const isChatOpen = ref(false)
-const pendingMessage = ref('')
 const chatMessagesRef = ref<HTMLDivElement | null>(null)
 const isSettingsOpen = ref(false)
 const settingsSaved = ref(false)
 const isResponding = ref(false)
 const chatError = ref('')
-const isListening = ref(false)
-const voiceSupported = ref(true)
-const voiceError = ref('')
 let agentInstance: Agent | null = null
 const settingsForm = reactive({
     apiKey: '',
     model: 'x-ai/grok-4.1-fast',
-    autoSubmitVoice: true,
 })
 const messages = ref<ChatMessage[]>([])
-let speechRecognition: any = null
-let voiceCapturedText = false
 
 const scrollMessagesToBottom = () => {
     nextTick(() => {
@@ -226,78 +110,6 @@ const ensureAgent = (): Agent => {
     return agentInstance
 }
 
-const handleSend = async () => {
-    const text = pendingMessage.value.trim()
-    if (!text || isResponding.value) {
-        return
-    }
-
-    let agent: Agent
-    try {
-        agent = ensureAgent()
-    } catch {
-        return
-    }
-
-    chatError.value = ''
-    messages.value.push({
-        id: Date.now(),
-        sender: 'self',
-        text,
-    })
-    pendingMessage.value = ''
-    scrollMessagesToBottom()
-    isResponding.value = true
-
-    try {
-        await agent.run(text)
-        messages.value = buildMessagesFromAgent(agent)
-        scrollMessagesToBottom()
-    } catch (error) {
-        chatError.value = error instanceof Error ? error.message : '未知错误，请稍后重试。'
-    } finally {
-        isResponding.value = false
-    }
-}
-
-const handleKeydown = (event: KeyboardEvent) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault()
-        handleSend()
-    }
-}
-
-const stopVoiceInput = () => {
-    if (speechRecognition && isListening.value) {
-        speechRecognition.stop()
-    }
-}
-
-const startVoiceInput = () => {
-    if (!voiceSupported.value || !speechRecognition || isListening.value) {
-        return
-    }
-
-    voiceError.value = ''
-    try {
-        speechRecognition.start()
-    } catch (error) {
-        voiceError.value = '无法开始语音识别，请稍后重试。'
-        isListening.value = false
-    }
-}
-
-const toggleVoiceInput = () => {
-    if (!voiceSupported.value) {
-        return
-    }
-    if (isListening.value) {
-        stopVoiceInput()
-    } else {
-        startVoiceInput()
-    }
-}
-
 const openSettings = () => {
     settingsSaved.value = false
     isSettingsOpen.value = true
@@ -314,7 +126,6 @@ const handleSettingsSubmit = () => {
     saveStoredOpenRouterConfig({
         apiKey: settingsForm.apiKey.trim(),
         model: settingsForm.model.trim() || undefined,
-        autoSubmitVoice: settingsForm.autoSubmitVoice,
     })
     settingsSaved.value = true
     agentInstance = null
@@ -341,85 +152,11 @@ onMounted(() => {
     if (stored) {
         settingsForm.apiKey = stored.apiKey ?? ''
         settingsForm.model = stored.model ?? settingsForm.model
-        settingsForm.autoSubmitVoice = stored.autoSubmitVoice ?? true
-    }
-
-    const SpeechRecognitionClass =
-        (window as typeof window & {
-            SpeechRecognition?: any
-            webkitSpeechRecognition?: any
-            SpeechGrammarList?: any
-            webkitSpeechGrammarList?: any
-        }).SpeechRecognition ||
-        (window as typeof window & {
-            SpeechRecognition?: any
-            webkitSpeechRecognition?: any
-            SpeechGrammarList?: any
-            webkitSpeechGrammarList?: any
-        }).webkitSpeechRecognition
-
-    if (!SpeechRecognitionClass) {
-        voiceSupported.value = false
-        voiceError.value = '当前浏览器不支持语音识别。'
-        return
-    }
-
-    speechRecognition = new SpeechRecognitionClass()
-    const SpeechGrammarListClass =
-        (window as typeof window & { SpeechGrammarList?: any; webkitSpeechGrammarList?: any })
-            .SpeechGrammarList ||
-        (window as typeof window & { SpeechGrammarList?: any; webkitSpeechGrammarList?: any })
-            .webkitSpeechGrammarList
-
-    if (SpeechGrammarListClass) {
-        const grammarList = new SpeechGrammarListClass()
-        const grammar = `#JSGF V1.0; grammar keywords; public <keyword> = ${VOICE_KEYWORDS.join(' | ')};`
-        grammarList.addFromString(grammar, 1)
-        speechRecognition.grammars = grammarList
-    }
-    speechRecognition.lang = 'zh-CN'
-    speechRecognition.maxAlternatives = 5
-    speechRecognition.continuous = false
-    speechRecognition.interimResults = true
-
-    speechRecognition.onstart = () => {
-        isListening.value = true
-        voiceCapturedText = false
-    }
-
-    speechRecognition.onend = () => {
-        isListening.value = false
-
-        if (voiceCapturedText && settingsForm.autoSubmitVoice && pendingMessage.value.trim()) {
-            handleSend()
-        }
-    }
-
-    speechRecognition.onerror = (event: any) => {
-        isListening.value = false
-        if (event?.error === 'not-allowed') {
-            voiceError.value = '未获得麦克风权限，请允许访问。'
-        } else {
-            voiceError.value = '语音识别出现问题，请稍后重试。'
-        }
-    }
-
-    speechRecognition.onresult = (event: any) => {
-        const transcript = Array.from(event.results || [])
-            .map((result: any) => result[0]?.transcript ?? '')
-            .join('')
-            .trim()
-
-        if (transcript) {
-            pendingMessage.value = applyKeywordCorrections(transcript)
-            voiceCapturedText = true
-        }
     }
 })
 
 onUnmounted(() => {
     // 清理工作
-    stopVoiceInput()
 })
 
 // 暴露 Avatar 引用
@@ -446,7 +183,7 @@ defineExpose({
             <button
                 class="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition hover:bg-white/20 active:scale-95"
                 type="button"
-                aria-label="Open settings"
+                aria-label="打开设置"
                 @click="openSettings"
             >
                 <IconCog class="h-5 w-5" />
@@ -504,41 +241,6 @@ defineExpose({
                     </button>
                 </div>
 
-                <!-- 输入框区域 -->
-                <div class="mt-4 px-2">
-                    <form @submit.prevent="handleSend" class="relative flex items-center gap-2">
-                        <button
-                            type="button"
-                            :disabled="!voiceSupported"
-                            @click="toggleVoiceInput"
-                            class="flex h-[54px] w-[54px] items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/60 shadow-md backdrop-blur-xl transition hover:bg-white/10 hover:text-white active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
-                            :class="{ 'bg-pink-500 text-black hover:bg-pink-500 shadow-pink-500/40': isListening }"
-                            aria-label="Voice input"
-                        >
-                            <IconMicrophone class="h-5 w-5" />
-                        </button>
-                        <div class="relative flex-1 overflow-hidden rounded-full border border-white/10 bg-white/5 backdrop-blur-xl transition-all focus-within:bg-white/10 focus-within:border-white/20 focus-within:shadow-[0_0_20px_rgba(255,255,255,0.05)]">
-                            <input
-                                v-model="pendingMessage"
-                                type="text"
-                                placeholder="Type a message..."
-                                class="w-full bg-transparent px-6 py-4 text-[15px] text-white placeholder:text-white/30 focus:outline-none"
-                                @keydown="handleKeydown"
-                                :disabled="isResponding"
-                            />
-                        </div>
-                        <button
-                            type="submit"
-                            :disabled="!pendingMessage.trim() || isResponding"
-                            class="flex h-[54px] w-[54px] items-center justify-center rounded-full bg-white text-black shadow-lg transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
-                        >
-                            <IconSend class="h-5 w-5 ml-0.5" />
-                        </button>
-                    </form>
-                    <div class="mt-2 min-h-[20px] px-3 text-sm text-red-200" v-if="voiceError">
-                        {{ voiceError }}
-                    </div>
-                </div>
             </div>
         </div>
 
@@ -547,7 +249,7 @@ defineExpose({
             <div v-if="isSettingsOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
                 <div class="relative w-[420px] max-w-[90vw] overflow-hidden rounded-[32px] border border-white/10 bg-[#1c1c1e]/90 p-8 shadow-2xl backdrop-blur-xl">
                     <header class="mb-8 flex items-center justify-between">
-                        <h2 class="text-xl font-semibold text-white">Settings</h2>
+                        <h2 class="text-xl font-semibold text-white">设置</h2>
                         <button @click="closeSettings" class="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-white/60 transition hover:bg-white/20 hover:text-white">
                             <span class="text-lg leading-none">×</span>
                         </button>
@@ -555,7 +257,7 @@ defineExpose({
 
                     <form class="space-y-6" @submit.prevent="handleSettingsSubmit">
                         <div class="space-y-2">
-                            <label class="ml-1 text-xs font-medium text-white/40 uppercase tracking-wider">API Key</label>
+                            <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">API 密钥</label>
                             <input
                                 v-model="settingsForm.apiKey"
                                 type="password"
@@ -566,37 +268,17 @@ defineExpose({
                         </div>
 
                         <div class="space-y-2">
-                            <label class="ml-1 text-xs font-medium text-white/40 uppercase tracking-wider">Model</label>
+                            <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">模型</label>
                             <input
                                 v-model="settingsForm.model"
                                 type="text"
                                 class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3.5 text-[15px] text-white transition focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
-                                placeholder="google/gemini-2.5-flash"
+                                placeholder="如：google/gemini-2.5-flash"
                             />
                         </div>
 
-                        <div class="flex items-center justify-between rounded-2xl border border-white/5 bg-black/20 px-4 py-3">
-                            <div class="space-y-1">
-                                <p class="text-[15px] font-medium text-white">语音结束后自动发送</p>
-                                <p class="text-xs text-white/50">当语音识别结束时自动提交消息</p>
-                            </div>
-                            <label class="relative inline-flex h-7 w-12 cursor-pointer items-center">
-                                <input
-                                    v-model="settingsForm.autoSubmitVoice"
-                                    type="checkbox"
-                                    class="peer sr-only"
-                                />
-                                <span
-                                    class="absolute left-0 top-0 h-full w-full rounded-full bg-white/10 transition peer-checked:bg-pink-500"
-                                ></span>
-                                <span
-                                    class="absolute left-[4px] top-[3px] h-[20px] w-[20px] rounded-full bg-white transition peer-checked:translate-x-[20px]"
-                                ></span>
-                            </label>
-                        </div>
-
                         <div class="flex items-center justify-between pt-4">
-                            <span v-if="settingsSaved" class="text-sm text-green-400 font-medium">Saved</span>
+                            <span v-if="settingsSaved" class="text-sm text-green-400 font-medium">已保存</span>
                             <span v-else></span>
                             
                             <button
@@ -604,7 +286,7 @@ defineExpose({
                                 class="rounded-full bg-white px-8 py-3 text-sm font-semibold text-black shadow-lg transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
                                 :disabled="!settingsForm.apiKey.trim()"
                             >
-                                Save Changes
+                                保存
                             </button>
                         </div>
                     </form>
