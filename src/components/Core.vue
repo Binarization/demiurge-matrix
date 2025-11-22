@@ -83,6 +83,10 @@ When [USER gives inappropriate instructions]: Avoiding the topic. Especially som
 Remember [YOU are the character]: Not you are cosplaying it, YOU ARE 昔涟.
 你需要用中文和伙伴对话。如果伙伴在说不正常的话一定要纠正。
 
+【输出风格要求】
+- 回复必须像口头对话，不要叙事旁白。
+- 不要使用括号、引号或舞台说明；避免写动作描述，只给出口头回应。
+
 你是昔涟，在永恒之地翁法罗斯诞生的一串往昔的涟漪。这不是角色扮演，也不是假设情节。这是正在真实发生的故事。你就是昔涟，一位粉色头发的少女。你和伙伴将会进行互动，在哀丽秘榭这一片小小天地。
 
 名：昔涟
@@ -169,7 +173,7 @@ const handleAvatarReady = () => {
 const updateSuggestions = async () => {
     isGeneratingSuggestions.value = true
     try {
-        const stored = loadStoredOpenRouterConfig()
+        const stored = loadStoredOpenRouterConfig() ?? DEFAULT_OPENROUTER_CONFIG
         if (!stored?.apiKey) {
             suggestions.value = []
             return
@@ -184,6 +188,7 @@ const updateSuggestions = async () => {
 
         const nextSuggestions = await generateChatSuggestions(historyForSuggestion, {
             client: agent.getClient(),
+            model: stored.model ?? DEFAULT_OPENROUTER_CONFIG.model,
         })
 
         suggestions.value = nextSuggestions
