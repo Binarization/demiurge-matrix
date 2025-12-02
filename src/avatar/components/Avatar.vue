@@ -75,7 +75,7 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
     // VRM 默认配置
     modelUrl: '/models/philia.vrm',
-    animationUrl: '/animations/philia/等待.vrma',
+    animationUrl: '/animations/philia/撒娇.vrma',
     vrmPosition: () => ({ x: -1, y: 2.5, z: 8 }),
     vrmRotation: () => ({ x: 0, y: 0, z: 0 }),
     vrmScale: 1,

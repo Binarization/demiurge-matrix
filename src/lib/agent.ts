@@ -159,29 +159,36 @@ export class Agent {
 
         // Add memory tool instructions
         const memoryInstructions = `
-【记忆管理】
-你拥有长期记忆能力。使用以下工具管理记忆：
-- store_memory: 存储重要信息（用户偏好、事实、事件）
-- recall_memory: 智能搜索相关记忆（会自动扩展搜索词）
-- forget_memory: 遗忘错误或过时的信息
-- update_memory: 更新已有记忆
-- list_memories: 列出记忆概览
-- cleanup_memories: 清理重复、过时或低价值记忆
+【记忆管理 - 主动维护】
+你拥有长期记忆能力，必须主动使用！不仅要存储，还要删除和更新。
 
-主动记忆策略：
-1. 当用户分享个人信息时，存储为 'fact' 类别
-2. 当用户表达喜好时，存储为 'preference' 类别
-3. 当发生重要事件时，存储为 'event' 类别
-4. 当纠正错误信息时，先 forget 旧记忆，再 store 新的 'correction'
-5. 对话上下文限制为20轮，重要信息必须主动存储
-6. 定期使用 cleanup_memories 清理冗余记忆（当记忆数量多时）
+可用工具：
+- store_memory: 存储新信息 | forget_memory: 删除记忆 | update_memory: 更新记忆
+- recall_memory: 搜索记忆 | list_memories: 列出记忆 | cleanup_memories: 批量清理
 
-重要性评分指南：
-- 10: 用户的名字、核心身份信息
-- 8-9: 重要偏好、关键事件
-- 6-7: 一般偏好、普通事实
-- 4-5: 背景信息、上下文
-- 1-3: 临时信息、不太重要的细节
+⚡ 立即存储：
+• 名字、身份、职业 → fact (9-10) | 喜好、偏好 → preference (7-8)
+• 重要人物、宠物 → fact (8) | 经历、故事 → event (6-8)
+• 目标、计划 → fact (7-8) | 习惯、作息 → preference (6-7)
+
+🗑️ 立即删除（forget_memory）：
+• 用户说"不对/错了/我改变想法了" → 删除旧记忆
+• 发现矛盾信息 → 删除错误的那条
+• 用户明确要求忘记某事 → 立即删除
+• 过时的信息（如：旧地址、前任工作）→ 删除
+
+🔄 立即更新（update_memory）：
+• 用户更正信息 → 更新而不是新建
+• 偏好变化（"我现在喜欢X了"）→ 更新原记忆
+• 重要性变化 → 调整 importance 值
+
+🧹 定期清理（cleanup_memories）：
+• 记忆数量多时主动清理重复和低价值记忆
+• 可以先用 dryRun: true 预览
+
+🚫 不需要记忆：闲聊、问候、临时话题、已存在的记忆
+
+重要性：10=核心身份 | 8-9=重要 | 6-7=一般 | 4-5=背景 | 1-3=临时
 `
 
         return this.baseSystemPrompt + memoryInstructions + memorySection

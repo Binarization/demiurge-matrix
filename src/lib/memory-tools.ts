@@ -10,8 +10,6 @@
 
 import type { Tool, ToolResult } from './agent'
 import { memoryStore, type MemoryCategory, type StoredMemory } from './memory-store'
-import { OpenRouterClient } from './openrouter'
-import { loadStoredOpenRouterConfig } from './openrouter-config'
 
 type StoreMemoryArgs = {
     content: string
@@ -42,47 +40,6 @@ type ListMemoriesArgs = {
     category?: MemoryCategory
     sortBy?: 'recent' | 'important'
     limit?: number
-}
-
-/**
- * Expand a search query into related Chinese terms using LLM (token-efficient)
- * Returns additional keywords to search for
- */
-async function expandSearchQuery(query: string): Promise<string[]> {
-    try {
-        const config = loadStoredOpenRouterConfig()
-        if (!config?.apiKey) return []
-
-        const client = new OpenRouterClient({
-            apiKey: config.apiKey,
-            model: config.model,
-        })
-
-        const response = await client.sendChat([
-            {
-                role: 'system',
-                content: `输出1-3个相关中文关键词用于记忆搜索。格式：词1,词2
-只输出逗号分隔的中文词，不要解释。`,
-            },
-            {
-                role: 'user',
-                content: query,
-            },
-        ])
-
-        const result = response?.choices?.[0]?.message?.content?.trim()
-        if (!result) return []
-
-        // Parse comma-separated keywords, only keep Chinese words
-        return result
-            .split(/[,，、\s]+/)
-            .map((k: string) => k.trim())
-            .filter((k: string) => k.length >= 1 && k.length <= 10 && /[\u4e00-\u9fa5]/.test(k))
-            .slice(0, 3)
-    } catch (error) {
-        console.warn('Failed to expand search query:', error)
-        return []
-    }
 }
 
 /**
@@ -123,6 +80,35 @@ Parameters:
         }
 
         try {
+            // Check for duplicate/similar content before storing
+            const normalizedContent = content.toLowerCase().replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+            const existingMemories = await memoryStore.search(content, 5)
+
+            for (const existing of existingMemories) {
+                const normalizedExisting = existing.content.toLowerCase().replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+
+                // Check similarity (if >70% overlap, consider duplicate)
+                const shorter = normalizedContent.length < normalizedExisting.length ? normalizedContent : normalizedExisting
+                const longer = normalizedContent.length >= normalizedExisting.length ? normalizedContent : normalizedExisting
+
+                if (shorter.length > 0 && longer.includes(shorter)) {
+                    // Very similar - update importance if new one is higher
+                    if (importance > existing.importance) {
+                        await memoryStore.update(existing.id, { importance })
+                        return {
+                            name: 'store_memory',
+                            output: { success: true, memoryId: existing.id, updated: true, duplicate: true },
+                            message: `已有相似记忆，已更新重要性：${existing.content.slice(0, 30)}...`,
+                        }
+                    }
+                    return {
+                        name: 'store_memory',
+                        output: { success: true, memoryId: existing.id, duplicate: true },
+                        message: `已有相似记忆，跳过存储：${existing.content.slice(0, 30)}...`,
+                    }
+                }
+            }
+
             const memory = await memoryStore.store(content, category, importance, { reason })
 
             return {
@@ -205,7 +191,7 @@ Parameters:
                 content: m.content,
                 category: m.category,
                 importance: m.importance,
-                createdAt: new Date(m.createdAt).toISOString(),
+                date: m.date,
             }))
 
             return {
@@ -398,7 +384,7 @@ Parameters:
                 content: m.content.slice(0, 100) + (m.content.length > 100 ? '...' : ''),
                 category: m.category,
                 importance: m.importance,
-                createdAt: new Date(m.createdAt).toISOString(),
+                date: m.date,
             }))
 
             return {
@@ -584,20 +570,20 @@ export function formatMemoriesForPrompt(memories: StoredMemory[]): string {
             context: '背景',
         }[m.category]
 
-        return `- [${categoryLabel}] ${m.content}`
+        return `- [${categoryLabel}] (${m.date}) ${m.content}`
     })
 
     return `\n【长期记忆】\n${lines.join('\n')}\n`
 }
 
 /**
- * Get relevant memories for a given context (intelligent search)
- * Uses Flexsearch + LLM query expansion, returns candidates for agent to evaluate
+ * Get relevant memories for a given context
+ * Uses Flexsearch full-text search + high-importance memories
+ * Agent will use recall_memory tool for more specific searches
  */
 export async function getRelevantMemories(
     context: string,
-    limit: number = 5,
-    useSmartSearch: boolean = true
+    limit: number = 5
 ): Promise<StoredMemory[]> {
     const seen = new Set<string>()
     const candidates: StoredMemory[] = []
@@ -611,27 +597,7 @@ export async function getRelevantMemories(
         }
     }
 
-    // 2. Expand query with related terms (if smart search enabled and not enough results)
-    if (useSmartSearch && candidates.length < limit) {
-        try {
-            const expandedTerms = await expandSearchQuery(context)
-            console.log('[Memory] Expanded search terms:', expandedTerms)
-
-            for (const term of expandedTerms) {
-                const termResults = await memoryStore.search(term, 3)
-                for (const memory of termResults) {
-                    if (!seen.has(memory.id)) {
-                        seen.add(memory.id)
-                        candidates.push(memory)
-                    }
-                }
-            }
-        } catch (error) {
-            console.warn('Failed to expand search:', error)
-        }
-    }
-
-    // 3. Add high-importance memories (always relevant)
+    // 2. Add high-importance memories (always relevant)
     const importantMemories = await memoryStore.getMostImportant(3)
     for (const memory of importantMemories) {
         if (!seen.has(memory.id)) {
@@ -640,8 +606,7 @@ export async function getRelevantMemories(
         }
     }
 
-    // 4. Simple shuffle + sort by importance (no LLM scoring - agent will evaluate)
-    //    This ensures variety while prioritizing important memories
+    // 3. Sort by importance tiers
     if (candidates.length > limit) {
         // Shuffle candidates to add variety
         for (let i = candidates.length - 1; i > 0; i--) {
@@ -649,9 +614,8 @@ export async function getRelevantMemories(
             ;[candidates[i], candidates[j]] = [candidates[j], candidates[i]]
         }
 
-        // Sort by importance (higher first) but keep some randomness
+        // Sort by importance (higher first)
         candidates.sort((a, b) => {
-            // Group by importance tiers (10-8, 7-5, 4-1)
             const tierA = Math.floor((a.importance - 1) / 3)
             const tierB = Math.floor((b.importance - 1) / 3)
             return tierB - tierA

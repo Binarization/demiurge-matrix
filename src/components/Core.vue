@@ -38,7 +38,7 @@ let agentInstance: Agent | null = null
 const DEFAULT_OPENROUTER_CONFIG_ENCODED = {
     apiKey: 'c2stb3ItdjEtMzY1OTNiYTcwODZkNjdhN2ViNTQyMjI1YjM1ZjFhN2QwMDAyMDhkYTdiNzMxMzYzOGNiMWYzNWQ0NWYxYzUzYg==',
     // Use a model that supports tool calling for memory features
-    model: 'google/gemini-2.0-flash-exp:free',
+    model: 'x-ai/grok-4.1-fast:free',
 }
 
 const decodeApiKey = (encoded: string): string => {

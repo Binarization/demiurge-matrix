@@ -43,6 +43,7 @@ export type StoredMemory = {
     lastAccessedAt: number
     accessCount: number
     isValid: number // 1 = valid, 0 = invalid (using number for IndexedDB compatibility)
+    date: string // Storage date in yyyy-mm-dd format
     metadata?: Record<string, unknown>
 }
 
@@ -277,6 +278,10 @@ class MemoryStore {
         const db = await this.getDB()
         await this.initSearchIndex()
 
+        // Generate current date in yyyy-mm-dd format
+        const now = new Date()
+        const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+
         const memory: StoredMemory = {
             id: this.generateId(),
             content,
@@ -287,6 +292,7 @@ class MemoryStore {
             lastAccessedAt: Date.now(),
             accessCount: 0,
             isValid: 1, // 1 = valid
+            date,
             metadata,
         }
 
@@ -483,38 +489,7 @@ class MemoryStore {
     }
 
     /**
-     * Mark a memory as invalid (soft delete)
-     */
-    async invalidate(id: string): Promise<void> {
-        const db = await this.getDB()
-
-        return new Promise((resolve, reject) => {
-            const transaction = db.transaction([STORE_NAME], 'readwrite')
-            const store = transaction.objectStore(STORE_NAME)
-            const getRequest = store.get(id)
-
-            getRequest.onsuccess = () => {
-                const memory = getRequest.result as StoredMemory | undefined
-                if (memory) {
-                    memory.isValid = 0 // 0 = invalid
-                    const putRequest = store.put(memory)
-                    putRequest.onsuccess = () => {
-                        // Remove from search index
-                        this.removeFromSearchIndex(id)
-                        resolve()
-                    }
-                    putRequest.onerror = () => reject(new Error(`Failed to invalidate memory: ${putRequest.error?.message}`))
-                } else {
-                    resolve()
-                }
-            }
-
-            getRequest.onerror = () => reject(new Error(`Failed to get memory: ${getRequest.error?.message}`))
-        })
-    }
-
-    /**
-     * Permanently delete a memory
+     * Delete a memory (hard delete)
      */
     async delete(id: string): Promise<void> {
         const db = await this.getDB()
@@ -531,6 +506,13 @@ class MemoryStore {
             }
             request.onerror = () => reject(new Error(`Failed to delete memory: ${request.error?.message}`))
         })
+    }
+
+    /**
+     * Alias for delete() - kept for backward compatibility
+     */
+    async invalidate(id: string): Promise<void> {
+        return this.delete(id)
     }
 
     /**
