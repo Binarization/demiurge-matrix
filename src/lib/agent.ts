@@ -162,10 +162,11 @@ export class Agent {
 【记忆管理】
 你拥有长期记忆能力。使用以下工具管理记忆：
 - store_memory: 存储重要信息（用户偏好、事实、事件）
-- recall_memory: 搜索相关记忆
+- recall_memory: 智能搜索相关记忆（会自动扩展搜索词）
 - forget_memory: 遗忘错误或过时的信息
 - update_memory: 更新已有记忆
 - list_memories: 列出记忆概览
+- cleanup_memories: 清理重复、过时或低价值记忆
 
 主动记忆策略：
 1. 当用户分享个人信息时，存储为 'fact' 类别
@@ -173,6 +174,7 @@ export class Agent {
 3. 当发生重要事件时，存储为 'event' 类别
 4. 当纠正错误信息时，先 forget 旧记忆，再 store 新的 'correction'
 5. 对话上下文限制为20轮，重要信息必须主动存储
+6. 定期使用 cleanup_memories 清理冗余记忆（当记忆数量多时）
 
 重要性评分指南：
 - 10: 用户的名字、核心身份信息
@@ -240,6 +242,16 @@ export class Agent {
                     description: 'Sort order',
                 }
                 properties.limit = { type: 'number', description: 'Maximum results' }
+            } else if (tool.name === 'cleanup_memories') {
+                properties.strategy = {
+                    type: 'string',
+                    enum: ['duplicates', 'outdated', 'low_importance', 'all'],
+                    description: 'Cleanup strategy: duplicates, outdated, low_importance, or all',
+                }
+                properties.dryRun = {
+                    type: 'boolean',
+                    description: 'If true, only report what would be cleaned without removing',
+                }
             } else if (tool.parameters) {
                 // Use custom parameters if defined
                 for (const [key, param] of Object.entries(tool.parameters)) {

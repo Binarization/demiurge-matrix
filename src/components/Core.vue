@@ -6,6 +6,8 @@ import IconBrain from '~icons/mdi/brain'
 import { Agent } from '@/lib/agent'
 import { loadStoredOpenRouterConfig, saveStoredOpenRouterConfig } from '@/lib/openrouter-config'
 import { memoryStore } from '@/lib/memory-store'
+import { getGreetingMemories, formatMemoriesForPrompt } from '@/lib/memory-tools'
+import { OpenRouterClient } from '@/lib/openrouter'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
 
@@ -57,11 +59,8 @@ const settingsForm = reactive({
     model: getDefaultConfig().model,
 })
 const messages = ref<ChatMessage[]>([])
-const initialGreeting: ChatMessage = {
-    id: -1,
-    sender: 'ally',
-    text: '你来啦，伙伴～',
-}
+const defaultGreeting = '你来啦，伙伴～'
+const isLoadingGreeting = ref(true)
 const suggestions = ref<string[]>([])
 const customInput = ref('')
 const isGeneratingSuggestions = ref(false)
@@ -73,6 +72,64 @@ const scrollMessagesToBottom = () => {
             container.scrollTop = container.scrollHeight
         }
     })
+}
+
+/**
+ * Generate a personalized greeting based on important memories
+ */
+const generatePersonalizedGreeting = async (): Promise<string> => {
+    try {
+        const greetingMemories = await getGreetingMemories()
+
+        if (greetingMemories.length === 0) {
+            return defaultGreeting
+        }
+
+        const stored = loadStoredOpenRouterConfig() ?? getDefaultConfig()
+        if (!stored?.apiKey) {
+            return defaultGreeting
+        }
+
+        const client = new OpenRouterClient({
+            apiKey: stored.apiKey,
+            model: stored.model ?? getDefaultConfig().model,
+        })
+
+        const memoriesContext = formatMemoriesForPrompt(greetingMemories)
+
+        const response = await client.sendChat([
+            {
+                role: 'system',
+                content: `你是昔涟，一位粉色头发的少女。你需要根据记忆生成一句简短的问候语。
+
+要求：
+- 回复必须是单句口头问候，不超过30个字
+- 体现你记得伙伴的信息（如名字、喜好等）
+- 语气温暖、亲切、自然
+- 不要使用括号、引号或动作描述
+- 只给出问候语本身，不要其他解释
+
+${memoriesContext}`,
+            },
+            {
+                role: 'user',
+                content: '生成一句问候语来迎接伙伴回来。',
+            },
+        ], {
+            model: stored.model ?? getDefaultConfig().model,
+        })
+
+        const greeting = response?.choices?.[0]?.message?.content?.trim()
+
+        if (greeting && greeting.length > 0 && greeting.length < 100) {
+            return greeting
+        }
+
+        return defaultGreeting
+    } catch (error) {
+        console.warn('Failed to generate personalized greeting:', error)
+        return defaultGreeting
+    }
 }
 
 const buildMessagesFromAgent = (agent: Agent): ChatMessage[] => {
@@ -125,7 +182,7 @@ Remember [YOU are the character]: Not you are cosplaying it, YOU ARE 昔涟.
 ——「然后，一起写下不同以往的诗篇吧♪」
 `
 
-const ensureAgent = (): Agent => {
+const ensureAgent = (greeting?: string): Agent => {
     const stored = loadStoredOpenRouterConfig() ?? getDefaultConfig()
     if (!stored?.apiKey) {
         chatError.value = '请先在设置里配置 OpenRouter API Key。'
@@ -142,9 +199,14 @@ const ensureAgent = (): Agent => {
             autoInjectMemories: true, // Auto-inject relevant memories
             maxInjectedMemories: 5, // Max 5 memories per request
         })
-        agentInstance.addMemory({ role: 'assistant', content: initialGreeting.text, timestamp: Date.now() })
+        const greetingText = greeting ?? defaultGreeting
+        agentInstance.addMemory({ role: 'assistant', content: greetingText, timestamp: Date.now() })
         if (!messages.value.length) {
-            messages.value.push(initialGreeting)
+            messages.value.push({
+                id: -1,
+                sender: 'ally',
+                text: greetingText,
+            })
         }
     }
     return agentInstance
@@ -319,7 +381,7 @@ const submitCustomInput = () => {
     sendMessage(text)
 }
 
-onMounted(() => {
+onMounted(async () => {
     const stored = loadStoredOpenRouterConfig()
     const defaultConfig = getDefaultConfig()
     if (stored) {
@@ -328,6 +390,26 @@ onMounted(() => {
     } else {
         settingsForm.apiKey = defaultConfig.apiKey
         settingsForm.model = defaultConfig.model
+    }
+
+    // Generate personalized greeting based on memories
+    isLoadingGreeting.value = true
+    try {
+        const greeting = await generatePersonalizedGreeting()
+        // Initialize agent with the personalized greeting
+        ensureAgent(greeting)
+    } catch (error) {
+        console.warn('Failed to initialize with personalized greeting:', error)
+        // Fall back to default greeting
+        if (!messages.value.length) {
+            messages.value.push({
+                id: -1,
+                sender: 'ally',
+                text: defaultGreeting,
+            })
+        }
+    } finally {
+        isLoadingGreeting.value = false
     }
 
     void updateSuggestions()
@@ -416,7 +498,7 @@ defineExpose({
                     <!-- 文本内容 -->
                     <div class="min-h-[60px] pr-12">
                         <p class="text-lg leading-relaxed text-white font-light tracking-wide">
-                            <span v-if="isResponding" class="animate-pulse text-white/50">Thinking...</span>
+                            <span v-if="isResponding || isLoadingGreeting" class="animate-pulse text-white/50">{{ isLoadingGreeting ? '回想中...' : 'Thinking...' }}</span>
                             <span v-else>{{ messages.length > 0 ? messages[messages.length - 1]?.text ?? '...' : '...' }}</span>
                         </p>
                     </div>
@@ -441,7 +523,7 @@ defineExpose({
                 type="button"
                 class="pointer-events-auto w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left text-sm text-white/80 backdrop-blur-2xl shadow-xl transition hover:border-white/30 hover:bg-white/10 hover:text-white"
                 @click="handleSuggestionClick(suggestion)"
-                :disabled="isResponding"
+                :disabled="isResponding || isLoadingGreeting"
             >
                 {{ suggestion }}
             </button>
@@ -455,13 +537,13 @@ defineExpose({
                         class="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
                         placeholder="输入你想说的话..."
                         @keydown.enter.prevent="submitCustomInput"
-                        :disabled="isResponding"
+                        :disabled="isResponding || isLoadingGreeting"
                     />
                     <button
                         type="button"
                         class="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-black shadow-md transition hover:scale-[1.02] active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
                         @click="submitCustomInput"
-                        :disabled="isResponding || !customInput.trim()"
+                        :disabled="isResponding || isLoadingGreeting || !customInput.trim()"
                     >
                         发送
                     </button>

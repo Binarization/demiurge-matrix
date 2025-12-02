@@ -10,6 +10,8 @@
 
 import type { Tool, ToolResult } from './agent'
 import { memoryStore, type MemoryCategory, type StoredMemory } from './memory-store'
+import { OpenRouterClient } from './openrouter'
+import { loadStoredOpenRouterConfig } from './openrouter-config'
 
 type StoreMemoryArgs = {
     content: string
@@ -40,6 +42,47 @@ type ListMemoriesArgs = {
     category?: MemoryCategory
     sortBy?: 'recent' | 'important'
     limit?: number
+}
+
+/**
+ * Expand a search query into related Chinese terms using LLM (token-efficient)
+ * Returns additional keywords to search for
+ */
+async function expandSearchQuery(query: string): Promise<string[]> {
+    try {
+        const config = loadStoredOpenRouterConfig()
+        if (!config?.apiKey) return []
+
+        const client = new OpenRouterClient({
+            apiKey: config.apiKey,
+            model: config.model,
+        })
+
+        const response = await client.sendChat([
+            {
+                role: 'system',
+                content: `输出1-3个相关中文关键词用于记忆搜索。格式：词1,词2
+只输出逗号分隔的中文词，不要解释。`,
+            },
+            {
+                role: 'user',
+                content: query,
+            },
+        ])
+
+        const result = response?.choices?.[0]?.message?.content?.trim()
+        if (!result) return []
+
+        // Parse comma-separated keywords, only keep Chinese words
+        return result
+            .split(/[,，、\s]+/)
+            .map((k: string) => k.trim())
+            .filter((k: string) => k.length >= 1 && k.length <= 10 && /[\u4e00-\u9fa5]/.test(k))
+            .slice(0, 3)
+    } catch (error) {
+        console.warn('Failed to expand search query:', error)
+        return []
+    }
 }
 
 /**
@@ -378,6 +421,142 @@ Parameters:
     },
 }
 
+type CleanupMemoriesArgs = {
+    strategy?: 'duplicates' | 'outdated' | 'low_importance' | 'all'
+    dryRun?: boolean
+}
+
+/**
+ * Tool for cleaning up redundant or outdated memories
+ */
+export const cleanupMemoriesTool: Tool = {
+    name: 'cleanup_memories',
+    description: `Analyze and clean up redundant, outdated, or low-value memories. Use this when:
+- You notice duplicate or very similar memories
+- Some memories seem outdated or no longer relevant
+- Memory count is getting high and needs pruning
+- User asks to organize or clean up memories
+
+Parameters:
+- strategy: 'duplicates' (similar content), 'outdated' (old + low access), 'low_importance' (importance <= 3), 'all' (comprehensive)
+- dryRun: If true, only report what would be cleaned without actually removing`,
+
+    execute: async (args: unknown): Promise<ToolResult> => {
+        const { strategy = 'all', dryRun = false } = args as CleanupMemoriesArgs
+
+        try {
+            const allMemories = await memoryStore.getRecent(100)
+            const toRemove: { id: string; reason: string; content: string }[] = []
+
+            // 1. Find duplicates (similar content)
+            if (strategy === 'duplicates' || strategy === 'all') {
+                const contentMap = new Map<string, StoredMemory[]>()
+
+                for (const memory of allMemories) {
+                    // Normalize content for comparison
+                    const normalized = memory.content
+                        .toLowerCase()
+                        .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+                        .slice(0, 50)
+
+                    if (!contentMap.has(normalized)) {
+                        contentMap.set(normalized, [])
+                    }
+                    contentMap.get(normalized)!.push(memory)
+                }
+
+                // Mark duplicates (keep highest importance one)
+                for (const [_, memories] of contentMap) {
+                    if (memories.length > 1) {
+                        memories.sort((a, b) => b.importance - a.importance)
+                        // Keep first (highest importance), mark rest for removal
+                        for (let i = 1; i < memories.length; i++) {
+                            toRemove.push({
+                                id: memories[i].id,
+                                reason: '重复内容',
+                                content: memories[i].content.slice(0, 30),
+                            })
+                        }
+                    }
+                }
+            }
+
+            // 2. Find outdated memories (old + rarely accessed + low importance)
+            if (strategy === 'outdated' || strategy === 'all') {
+                const now = Date.now()
+                const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000
+
+                for (const memory of allMemories) {
+                    const isDuplicate = toRemove.some(r => r.id === memory.id)
+                    if (isDuplicate) continue
+
+                    // Old, rarely accessed, and not important
+                    if (
+                        memory.createdAt < thirtyDaysAgo &&
+                        memory.accessCount < 3 &&
+                        memory.importance <= 4 &&
+                        memory.category !== 'fact' // Don't auto-remove facts
+                    ) {
+                        toRemove.push({
+                            id: memory.id,
+                            reason: '过时且很少访问',
+                            content: memory.content.slice(0, 30),
+                        })
+                    }
+                }
+            }
+
+            // 3. Find low importance memories
+            if (strategy === 'low_importance' || strategy === 'all') {
+                for (const memory of allMemories) {
+                    const isDuplicate = toRemove.some(r => r.id === memory.id)
+                    if (isDuplicate) continue
+
+                    if (
+                        memory.importance <= 2 &&
+                        memory.accessCount < 2 &&
+                        memory.category === 'context' // Only auto-remove context with very low importance
+                    ) {
+                        toRemove.push({
+                            id: memory.id,
+                            reason: '低重要性背景信息',
+                            content: memory.content.slice(0, 30),
+                        })
+                    }
+                }
+            }
+
+            // Execute cleanup if not dry run
+            if (!dryRun && toRemove.length > 0) {
+                for (const item of toRemove) {
+                    await memoryStore.invalidate(item.id)
+                }
+            }
+
+            const summary = toRemove.map(r => `- ${r.content}... (${r.reason})`).join('\n')
+
+            return {
+                name: 'cleanup_memories',
+                output: {
+                    success: true,
+                    removed: toRemove.length,
+                    dryRun,
+                    details: toRemove,
+                },
+                message: dryRun
+                    ? `发现 ${toRemove.length} 条可清理记忆:\n${summary}`
+                    : `已清理 ${toRemove.length} 条记忆:\n${summary}`,
+            }
+        } catch (error) {
+            return {
+                name: 'cleanup_memories',
+                output: { success: false, error: error instanceof Error ? error.message : 'Unknown error' },
+                message: '清理记忆失败。',
+            }
+        }
+    },
+}
+
 /**
  * All memory tools bundled together
  */
@@ -387,6 +566,7 @@ export const memoryTools: Tool[] = [
     forgetMemoryTool,
     updateMemoryTool,
     listMemoriesTool,
+    cleanupMemoriesTool,
 ]
 
 /**
@@ -411,34 +591,111 @@ export function formatMemoriesForPrompt(memories: StoredMemory[]): string {
 }
 
 /**
- * Get relevant memories for a given context
+ * Get relevant memories for a given context (intelligent search)
+ * Uses Flexsearch + LLM query expansion, returns candidates for agent to evaluate
  */
 export async function getRelevantMemories(
     context: string,
-    limit: number = 5
+    limit: number = 5,
+    useSmartSearch: boolean = true
 ): Promise<StoredMemory[]> {
-    const searchResults = await memoryStore.search(context, limit)
-
-    // Also get high-importance memories that might be relevant
-    const importantMemories = await memoryStore.getMostImportant(3)
-
-    // Merge and deduplicate
     const seen = new Set<string>()
-    const merged: StoredMemory[] = []
+    const candidates: StoredMemory[] = []
 
-    for (const memory of [...searchResults, ...importantMemories]) {
+    // 1. Direct Flexsearch full-text search
+    const directResults = await memoryStore.search(context, limit * 2)
+    for (const memory of directResults) {
         if (!seen.has(memory.id)) {
             seen.add(memory.id)
-            merged.push(memory)
+            candidates.push(memory)
         }
     }
 
-    // Sort by relevance score (if available) or importance
-    return merged
-        .sort((a, b) => {
-            const aScore = ('relevanceScore' in a ? (a as any).relevanceScore : 0) + a.importance
-            const bScore = ('relevanceScore' in b ? (b as any).relevanceScore : 0) + b.importance
-            return bScore - aScore
+    // 2. Expand query with related terms (if smart search enabled and not enough results)
+    if (useSmartSearch && candidates.length < limit) {
+        try {
+            const expandedTerms = await expandSearchQuery(context)
+            console.log('[Memory] Expanded search terms:', expandedTerms)
+
+            for (const term of expandedTerms) {
+                const termResults = await memoryStore.search(term, 3)
+                for (const memory of termResults) {
+                    if (!seen.has(memory.id)) {
+                        seen.add(memory.id)
+                        candidates.push(memory)
+                    }
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to expand search:', error)
+        }
+    }
+
+    // 3. Add high-importance memories (always relevant)
+    const importantMemories = await memoryStore.getMostImportant(3)
+    for (const memory of importantMemories) {
+        if (!seen.has(memory.id)) {
+            seen.add(memory.id)
+            candidates.push(memory)
+        }
+    }
+
+    // 4. Simple shuffle + sort by importance (no LLM scoring - agent will evaluate)
+    //    This ensures variety while prioritizing important memories
+    if (candidates.length > limit) {
+        // Shuffle candidates to add variety
+        for (let i = candidates.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1))
+            ;[candidates[i], candidates[j]] = [candidates[j], candidates[i]]
+        }
+
+        // Sort by importance (higher first) but keep some randomness
+        candidates.sort((a, b) => {
+            // Group by importance tiers (10-8, 7-5, 4-1)
+            const tierA = Math.floor((a.importance - 1) / 3)
+            const tierB = Math.floor((b.importance - 1) / 3)
+            return tierB - tierA
         })
-        .slice(0, limit)
+    }
+
+    return candidates.slice(0, limit)
+}
+
+/**
+ * Get memories suitable for generating an initial greeting
+ * Returns high-importance facts and preferences about the user
+ */
+export async function getGreetingMemories(): Promise<StoredMemory[]> {
+    const memories: StoredMemory[] = []
+    const seen = new Set<string>()
+
+    // Get high-importance facts (like user's name)
+    const facts = await memoryStore.getByCategory('fact', 10)
+    for (const m of facts.filter(f => f.importance >= 7)) {
+        if (!seen.has(m.id)) {
+            seen.add(m.id)
+            memories.push(m)
+        }
+    }
+
+    // Get important preferences
+    const preferences = await memoryStore.getByCategory('preference', 5)
+    for (const m of preferences.filter(p => p.importance >= 6)) {
+        if (!seen.has(m.id)) {
+            seen.add(m.id)
+            memories.push(m)
+        }
+    }
+
+    // Get recent significant events
+    const events = await memoryStore.getByCategory('event', 3)
+    for (const m of events.filter(e => e.importance >= 7)) {
+        if (!seen.has(m.id)) {
+            seen.add(m.id)
+            memories.push(m)
+        }
+    }
+
+    // Sort by importance descending
+    return memories.sort((a, b) => b.importance - a.importance).slice(0, 5)
 }
