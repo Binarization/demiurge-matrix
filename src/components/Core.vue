@@ -388,8 +388,10 @@ onMounted(async () => {
         settingsForm.apiKey = stored.apiKey ?? defaultConfig.apiKey
         settingsForm.model = stored.model ?? defaultConfig.model
     } else {
+        // No stored config - use default and persist it
         settingsForm.apiKey = defaultConfig.apiKey
         settingsForm.model = defaultConfig.model
+        saveStoredOpenRouterConfig(defaultConfig)
     }
 
     // Generate personalized greeting based on memories
