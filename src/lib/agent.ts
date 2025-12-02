@@ -427,44 +427,22 @@ export class Agent {
                 console.log('[Agent] Tool calls requested:', toolCalls.map(t => ({ name: t.name, id: t.id })))
             }
 
-            // If we have content, use it as the response
-            if (content) {
-                this.history.push({ role: 'assistant', content })
-                finalContent = content
-            }
-
             // Execute any tool calls
             if (toolCalls.length > 0) {
-                // Execute tools - for memory operations, we don't need to wait for a follow-up response
-                // The content (if any) is already captured above
+                // Always add assistant message with tool_calls to history first
+                this.history.push({
+                    role: 'assistant',
+                    content: content || '',
+                    tool_calls: rawToolCalls,
+                })
+
+                // Execute tools
                 const toolResults = await this.executeToolCalls(toolCalls)
 
                 // Debug: log tool results
                 console.log('[Agent] Tool results:', toolResults.map(r => ({ name: r.name, success: (r.output as any)?.success })))
 
-                // Check if all tool calls are memory-related (fire-and-forget)
-                const isAllMemoryTools = toolCalls.every(tc =>
-                    ['store_memory', 'recall_memory', 'forget_memory', 'update_memory', 'list_memories'].includes(tc.name)
-                )
-
-                // If we already have content and all tools are memory tools, we're done
-                // The memory operations completed, and we have the response
-                if (content && isAllMemoryTools) {
-                    console.log('[Agent] Content received with memory tools - done')
-                    break
-                }
-
-                // If no content, we need to continue the conversation to get a response
-                // Add assistant message with tool_calls to history
-                if (!content) {
-                    this.history.push({
-                        role: 'assistant',
-                        content: '',
-                        tool_calls: rawToolCalls,
-                    })
-                }
-
-                // Add tool results to history for follow-up
+                // Always add tool results to history
                 for (const result of toolResults) {
                     const toolContent =
                         result.message ??
@@ -488,6 +466,22 @@ export class Agent {
                     }
                 }
 
+                // If we have content, use it as the response
+                if (content) {
+                    finalContent = content
+                }
+
+                // Check if all tool calls are memory-related (fire-and-forget)
+                const isAllMemoryTools = toolCalls.every(tc =>
+                    ['store_memory', 'recall_memory', 'forget_memory', 'update_memory', 'list_memories', 'cleanup_memories'].includes(tc.name)
+                )
+
+                // If we have content and all tools are memory tools, we're done
+                if (content && isAllMemoryTools) {
+                    console.log('[Agent] Content received with memory tools - done')
+                    break
+                }
+
                 // If we have content already, we're done (tools were side effects)
                 if (content) {
                     console.log('[Agent] Content already received, tools executed as side effects - done')
@@ -498,6 +492,12 @@ export class Agent {
                 iterations += 1
                 console.log('[Agent] No content yet, continuing to iteration', iterations)
                 continue
+            }
+
+            // No tool calls - just add assistant content to history
+            if (content) {
+                this.history.push({ role: 'assistant', content })
+                finalContent = content
             }
 
             // No tool calls and no content - unusual, but break to avoid infinite loop
@@ -521,7 +521,7 @@ export class Agent {
             if (!tool) {
                 return {
                     name: toolCall.name,
-                    output: `Tool "${toolCall.name}" not registered`,
+                    output: { success: false, error: `Tool "${toolCall.name}" not registered` },
                     message: `Tool "${toolCall.name}" not registered`,
                     toolCallId,
                 } satisfies ToolResult
@@ -532,15 +532,20 @@ export class Agent {
                     addMemory: entry => this.addMemory(entry),
                     memory: this.memory,
                 })
+                // Ensure output always has success field
+                const normalizedOutput = typeof output.output === 'object' && output.output !== null
+                    ? { success: true, ...output.output }
+                    : { success: true, result: output.output }
                 return {
                     ...output,
+                    output: normalizedOutput,
                     name: output.name ?? toolCall.name,
                     toolCallId: output.toolCallId ?? toolCallId,
                 }
             } catch (error) {
                 return {
                     name: toolCall.name,
-                    output: error instanceof Error ? error.message : 'Unknown tool error',
+                    output: { success: false, error: error instanceof Error ? error.message : 'Unknown tool error' },
                     message: error instanceof Error ? error.message : 'Unknown tool error',
                     toolCallId,
                 } satisfies ToolResult
