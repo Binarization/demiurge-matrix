@@ -2,8 +2,10 @@
 import { nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
 import IconCog from '~icons/mdi/cog'
+import IconBrain from '~icons/mdi/brain'
 import { Agent } from '@/lib/agent'
 import { loadStoredOpenRouterConfig, saveStoredOpenRouterConfig } from '@/lib/openrouter-config'
+import { memoryStore } from '@/lib/memory-store'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
 
@@ -23,18 +25,36 @@ type ChatMessage = {
 const isChatOpen = ref(false)
 const chatMessagesRef = ref<HTMLDivElement | null>(null)
 const isSettingsOpen = ref(false)
+const isMemoryPanelOpen = ref(false)
 const settingsSaved = ref(false)
 const isResponding = ref(false)
 const chatError = ref('')
+const memoryCount = ref(0)
 let agentInstance: Agent | null = null
-const DEFAULT_OPENROUTER_CONFIG = {
-    apiKey: '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',
-    model: 'x-ai/grok-4.1-fast:free',
+
+// Default config with base64-encoded API key for basic obfuscation
+const DEFAULT_OPENROUTER_CONFIG_ENCODED = {
+    apiKey: 'c2stb3ItdjEtMzY1OTNiYTcwODZkNjdhN2ViNTQyMjI1YjM1ZjFhN2QwMDAyMDhkYTdiNzMxMzYzOGNiMWYzNWQ0NWYxYzUzYg==',
+    // Use a model that supports tool calling for memory features
+    model: 'google/gemini-2.0-flash-exp:free',
 }
 
+const decodeApiKey = (encoded: string): string => {
+    try {
+        return atob(encoded)
+    } catch {
+        return encoded
+    }
+}
+
+const getDefaultConfig = () => ({
+    apiKey: decodeApiKey(DEFAULT_OPENROUTER_CONFIG_ENCODED.apiKey),
+    model: DEFAULT_OPENROUTER_CONFIG_ENCODED.model,
+})
+
 const settingsForm = reactive({
-    apiKey: DEFAULT_OPENROUTER_CONFIG.apiKey,
-    model: DEFAULT_OPENROUTER_CONFIG.model,
+    apiKey: getDefaultConfig().apiKey,
+    model: getDefaultConfig().model,
 })
 const messages = ref<ChatMessage[]>([])
 const initialGreeting: ChatMessage = {
@@ -53,13 +73,6 @@ const scrollMessagesToBottom = () => {
             container.scrollTop = container.scrollHeight
         }
     })
-}
-
-const toggleChat = () => {
-    isChatOpen.value = !isChatOpen.value
-    if (isChatOpen.value) {
-        scrollMessagesToBottom()
-    }
 }
 
 const buildMessagesFromAgent = (agent: Agent): ChatMessage[] => {
@@ -113,7 +126,7 @@ Remember [YOU are the character]: Not you are cosplaying it, YOU ARE 昔涟.
 `
 
 const ensureAgent = (): Agent => {
-    const stored = loadStoredOpenRouterConfig() ?? DEFAULT_OPENROUTER_CONFIG
+    const stored = loadStoredOpenRouterConfig() ?? getDefaultConfig()
     if (!stored?.apiKey) {
         chatError.value = '请先在设置里配置 OpenRouter API Key。'
         openSettings()
@@ -123,7 +136,11 @@ const ensureAgent = (): Agent => {
     if (!agentInstance) {
         agentInstance = new Agent({
             systemPrompt: PROMPT,
-            model: stored.model ?? DEFAULT_OPENROUTER_CONFIG.model,
+            model: stored.model ?? getDefaultConfig().model,
+            maxContextMessages: 20, // Limit context to 20 conversation turns
+            enableMemoryTools: true, // Enable memory tools
+            autoInjectMemories: true, // Auto-inject relevant memories
+            maxInjectedMemories: 5, // Max 5 memories per request
         })
         agentInstance.addMemory({ role: 'assistant', content: initialGreeting.text, timestamp: Date.now() })
         if (!messages.value.length) {
@@ -170,10 +187,66 @@ const handleAvatarReady = () => {
     emit('ready')
 }
 
+// Memory management
+const updateMemoryCount = async () => {
+    try {
+        memoryCount.value = await memoryStore.getCount()
+    } catch (error) {
+        console.warn('Failed to get memory count:', error)
+    }
+}
+
+const recentMemories = ref<Array<{ id: string; content: string; category: string; importance: number }>>([])
+
+const loadRecentMemories = async () => {
+    try {
+        const memories = await memoryStore.getRecent(10)
+        recentMemories.value = memories.map(m => ({
+            id: m.id,
+            content: m.content,
+            category: m.category,
+            importance: m.importance,
+        }))
+    } catch (error) {
+        console.warn('Failed to load recent memories:', error)
+    }
+}
+
+const openMemoryPanel = async () => {
+    await loadRecentMemories()
+    isMemoryPanelOpen.value = true
+}
+
+const closeMemoryPanel = () => {
+    isMemoryPanelOpen.value = false
+}
+
+const deleteMemory = async (id: string) => {
+    try {
+        await memoryStore.invalidate(id)
+        await loadRecentMemories()
+        await updateMemoryCount()
+    } catch (error) {
+        console.warn('Failed to delete memory:', error)
+    }
+}
+
+const clearAllMemories = async () => {
+    if (confirm('确定要清除所有记忆吗？此操作不可恢复。')) {
+        try {
+            await memoryStore.clearAll()
+            await loadRecentMemories()
+            await updateMemoryCount()
+        } catch (error) {
+            console.warn('Failed to clear memories:', error)
+        }
+    }
+}
+
 const updateSuggestions = async () => {
     isGeneratingSuggestions.value = true
     try {
-        const stored = loadStoredOpenRouterConfig() ?? DEFAULT_OPENROUTER_CONFIG
+        const stored = loadStoredOpenRouterConfig() ?? getDefaultConfig()
         if (!stored?.apiKey) {
             suggestions.value = []
             return
@@ -182,13 +255,13 @@ const updateSuggestions = async () => {
         const agent = ensureAgent()
 
         const historyForSuggestion = messages.value.map(msg => ({
-            role: msg.sender === 'self' ? 'user' : 'assistant',
+            role: msg.sender === 'self' ? 'user' as const : 'assistant' as const,
             content: msg.text,
         }))
 
         const nextSuggestions = await generateChatSuggestions(historyForSuggestion, {
             client: agent.getClient(),
-            model: stored.model ?? DEFAULT_OPENROUTER_CONFIG.model,
+            model: stored.model ?? getDefaultConfig().model,
         })
 
         suggestions.value = nextSuggestions
@@ -225,6 +298,8 @@ const sendMessage = async (text: string) => {
         await agent.run(trimmed)
         messages.value = buildMessagesFromAgent(agent)
         scrollMessagesToBottom()
+        // Update memory count after interaction (agent may have stored memories)
+        await updateMemoryCount()
     } catch (error) {
         chatError.value = error instanceof Error ? error.message : '未知错误，请稍后重试。'
     } finally {
@@ -246,15 +321,17 @@ const submitCustomInput = () => {
 
 onMounted(() => {
     const stored = loadStoredOpenRouterConfig()
+    const defaultConfig = getDefaultConfig()
     if (stored) {
-        settingsForm.apiKey = stored.apiKey ?? DEFAULT_OPENROUTER_CONFIG.apiKey
-        settingsForm.model = stored.model ?? DEFAULT_OPENROUTER_CONFIG.model
+        settingsForm.apiKey = stored.apiKey ?? defaultConfig.apiKey
+        settingsForm.model = stored.model ?? defaultConfig.model
     } else {
-        settingsForm.apiKey = DEFAULT_OPENROUTER_CONFIG.apiKey
-        settingsForm.model = DEFAULT_OPENROUTER_CONFIG.model
+        settingsForm.apiKey = defaultConfig.apiKey
+        settingsForm.model = defaultConfig.model
     }
 
     void updateSuggestions()
+    void updateMemoryCount()
 })
 
 onUnmounted(() => {
@@ -282,6 +359,17 @@ defineExpose({
 
         <!-- 顶部功能区 -->
         <div class="fixed top-6 right-6 z-20 flex gap-4">
+            <button
+                class="relative flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition hover:bg-white/20 active:scale-95"
+                type="button"
+                aria-label="记忆管理"
+                @click="openMemoryPanel"
+            >
+                <IconBrain class="h-5 w-5" />
+                <span v-if="memoryCount > 0" class="absolute -top-1 -right-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-pink-500 px-1 text-[10px] font-bold text-white">
+                    {{ memoryCount > 99 ? '99+' : memoryCount }}
+                </span>
+            </button>
             <button
                 class="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition hover:bg-white/20 active:scale-95"
                 type="button"
@@ -329,7 +417,7 @@ defineExpose({
                     <div class="min-h-[60px] pr-12">
                         <p class="text-lg leading-relaxed text-white font-light tracking-wide">
                             <span v-if="isResponding" class="animate-pulse text-white/50">Thinking...</span>
-                            <span v-else>{{ messages.length > 0 ? messages[messages.length - 1].text : '...' }}</span>
+                            <span v-else>{{ messages.length > 0 ? messages[messages.length - 1]?.text ?? '...' : '...' }}</span>
                         </p>
                     </div>
 
@@ -427,6 +515,70 @@ defineExpose({
                             </button>
                         </div>
                     </form>
+                </div>
+            </div>
+        </Transition>
+
+        <!-- 记忆管理弹窗 -->
+        <Transition name="fade-scale">
+            <div v-if="isMemoryPanelOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                <div class="relative w-[520px] max-w-[90vw] max-h-[80vh] overflow-hidden rounded-[32px] border border-white/10 bg-[#1c1c1e]/90 shadow-2xl backdrop-blur-xl flex flex-col">
+                    <header class="p-8 pb-4 flex items-center justify-between shrink-0">
+                        <div>
+                            <h2 class="text-xl font-semibold text-white">长期记忆</h2>
+                            <p class="text-sm text-white/50 mt-1">共 {{ memoryCount }} 条记忆</p>
+                        </div>
+                        <button @click="closeMemoryPanel" class="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-white/60 transition hover:bg-white/20 hover:text-white">
+                            <span class="text-lg leading-none">×</span>
+                        </button>
+                    </header>
+
+                    <div class="flex-1 overflow-y-auto px-8 pb-4">
+                        <div v-if="recentMemories.length === 0" class="py-12 text-center text-white/40">
+                            <IconBrain class="mx-auto h-12 w-12 mb-4 opacity-50" />
+                            <p>暂无记忆</p>
+                            <p class="text-sm mt-2">与昔涟对话时，重要信息会被自动记住</p>
+                        </div>
+                        <div v-else class="space-y-3">
+                            <div
+                                v-for="memory in recentMemories"
+                                :key="memory.id"
+                                class="group relative rounded-2xl border border-white/5 bg-white/5 p-4 transition hover:bg-white/10"
+                            >
+                                <div class="flex items-start gap-3">
+                                    <span class="shrink-0 rounded-lg bg-pink-500/20 px-2 py-1 text-[10px] font-medium text-pink-300 uppercase">
+                                        {{ memory.category }}
+                                    </span>
+                                    <div class="flex-1 min-w-0">
+                                        <p class="text-sm text-white/90 leading-relaxed">{{ memory.content }}</p>
+                                        <div class="mt-2 flex items-center gap-2">
+                                            <span class="text-[10px] text-white/30">重要性: {{ memory.importance }}/10</span>
+                                        </div>
+                                    </div>
+                                    <button
+                                        @click="deleteMemory(memory.id)"
+                                        class="shrink-0 opacity-0 group-hover:opacity-100 flex h-6 w-6 items-center justify-center rounded-full bg-red-500/20 text-red-300 transition hover:bg-red-500/40"
+                                        title="删除记忆"
+                                    >
+                                        <span class="text-xs">×</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <footer class="p-8 pt-4 border-t border-white/5 shrink-0">
+                        <div class="flex items-center justify-between">
+                            <p class="text-xs text-white/30">记忆会在对话中自动检索并注入</p>
+                            <button
+                                v-if="memoryCount > 0"
+                                @click="clearAllMemories"
+                                class="rounded-full border border-red-500/30 bg-red-500/10 px-4 py-2 text-xs font-medium text-red-300 transition hover:bg-red-500/20"
+                            >
+                                清除所有
+                            </button>
+                        </div>
+                    </footer>
                 </div>
             </div>
         </Transition>

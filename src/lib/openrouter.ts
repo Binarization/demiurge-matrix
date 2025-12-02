@@ -8,13 +8,31 @@ export type ChatMessage = {
     content: string
     name?: string
     toolCallId?: string
+    tool_call_id?: string  // Some SDKs expect snake_case directly
+    tool_calls?: Array<{
+        id: string
+        type: 'function'
+        function: {
+            name: string
+            arguments: string
+        }
+    }>
 }
 
 type OpenRouterMessage = {
     role: 'system' | 'user' | 'assistant' | 'tool'
-    content?: string
+    content?: string | null
     name?: string
-    toolCallId?: string
+    tool_call_id?: string  // OpenAI API uses snake_case
+    toolCallId?: string    // SDK might use camelCase
+    tool_calls?: Array<{
+        id: string
+        type: 'function'
+        function: {
+            name: string
+            arguments: string
+        }
+    }>
 }
 
 type OpenRouterClientOptions = {
@@ -54,17 +72,22 @@ export class OpenRouterClient {
             model?: string
             stream?: boolean
             headers?: Record<string, string>
+            tools?: any[]
         }
     ): Promise<any> {
         const headers = { ...this.defaultHeaders, ...options?.headers }
-        return this.client.chat.send(
-            {
-                model: options?.model ?? this.model,
-                messages: this.toOpenRouterMessages(messages) as any,
-                stream: options?.stream ?? false,
-            },
-            { headers }
-        )
+        const requestBody: any = {
+            model: options?.model ?? this.model,
+            messages: this.toOpenRouterMessages(messages) as any,
+            stream: options?.stream ?? false,
+        }
+
+        // Add tools if provided
+        if (options?.tools && options.tools.length > 0) {
+            requestBody.tools = options.tools
+        }
+
+        return this.client.chat.send(requestBody, { headers })
     }
 
     private toOpenRouterMessages(messages: ChatMessage[]): OpenRouterMessage[] {
@@ -75,9 +98,19 @@ export class OpenRouterClient {
                 case 'user':
                     return { role: 'user', content: message.content, name: message.name }
                 case 'assistant':
-                    return { role: 'assistant', content: message.content, name: message.name }
+                    // Include tool_calls if present
+                    const assistantMsg: OpenRouterMessage = {
+                        role: 'assistant',
+                        content: message.content || null,
+                        name: message.name
+                    }
+                    if (message.tool_calls && message.tool_calls.length > 0) {
+                        assistantMsg.tool_calls = message.tool_calls
+                    }
+                    return assistantMsg
                 case 'tool': {
-                    if (!message.toolCallId) {
+                    const tid = message.toolCallId ?? message.tool_call_id
+                    if (!tid) {
                         throw new Error(
                             'Tool messages require a toolCallId for OpenRouter compatibility.'
                         )
@@ -85,7 +118,8 @@ export class OpenRouterClient {
                     return {
                         role: 'tool',
                         content: message.content,
-                        toolCallId: message.toolCallId,
+                        tool_call_id: tid,  // OpenAI API uses snake_case
+                        toolCallId: tid,    // SDK might validate camelCase
                     }
                 }
                 default:
