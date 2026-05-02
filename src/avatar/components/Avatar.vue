@@ -20,6 +20,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { VRMUtils } from '@pixiv/three-vrm'
 import { VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation'
 import { VRMLookAtSmootherLoaderPlugin } from '@/avatar/libs/VRMLookAtSmootherLoaderPlugin/VRMLookAtSmootherLoaderPlugin'
+import type { VRMLookAtSmoother } from '@/avatar/libs/VRMLookAtSmootherLoaderPlugin/VRMLookAtSmoother'
 import { Preloader, PreloadResource, PreloaderEvent } from '@/avatar/utils/Preloader'
 import { VrmController } from '@/avatar/utils/VrmController'
 // @ts-ignore - GaussianSplats3D doesn't have type definitions
@@ -164,6 +165,15 @@ let controls: OrbitControls | null = null
 let skysphere: THREE.Mesh | null = null
 let isPaused = false // 是否暂停渲染
 
+// Cursor-driven lookAt. cursorTarget rides a virtual plane in front of the
+// avatar; VRMLookAtSmoother.userTarget is wired to it so the head/eyes
+// follow the pointer with smoothing + saccade.
+let cursorTarget: THREE.Object3D | null = null
+const cursorRaycaster = new THREE.Raycaster()
+const cursorNDC = new THREE.Vector2()
+const cursorLookPlane = new THREE.Plane()
+const cursorHit = new THREE.Vector3()
+
 // 背景渲染相关
 const INITIAL_RENDER_FRAME_COUNT = 60 // 初始强制渲染帧数
 const LOW_PERFORMANCE_FPS_THRESHOLD = 50
@@ -290,6 +300,15 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
 
         // 保存VRM引用，用于位置控制
         vrmModel = modelVrm
+
+        // Cursor-driven lookAt. The smoother already does the smoothing + head
+        // blend; we just keep cursorTarget in sync with the pointer. Plane
+        // placed slightly in front of the avatar so cursor sweeps map to a
+        // natural angular range.
+        if (vrmScene && modelVrm.lookAt) {
+            cursorLookPlane.set(new THREE.Vector3(0, 0, 1), -(vrmPosition.value.z + 1))
+            ;(modelVrm.lookAt as VRMLookAtSmoother).userTarget = cursorTarget
+        }
 
         // 初始化 VRM 位置（只设置一次）
         vrmModel.scene.position.set(vrmPosition.value.x, vrmPosition.value.y, vrmPosition.value.z)
@@ -658,6 +677,36 @@ function onWindowResize() {
 }
 
 /**
+ * Move the cursor look target onto the virtual plane in front of the avatar.
+ * The smoother takes it from there.
+ */
+function onPointerMove(event: PointerEvent) {
+    if (!camera || !cursorTarget) return
+    cursorNDC.x = (event.clientX / window.innerWidth) * 2 - 1
+    cursorNDC.y = -(event.clientY / window.innerHeight) * 2 + 1
+    cursorRaycaster.setFromCamera(cursorNDC, camera)
+    if (cursorRaycaster.ray.intersectPlane(cursorLookPlane, cursorHit)) {
+        cursorTarget.position.copy(cursorHit)
+    }
+}
+
+/**
+ * Release the cursor target so the smoother falls back to the animation's
+ * gaze. Triggered when the pointer leaves the window or the user tabs away.
+ */
+function releaseCursorTarget() {
+    if (vrmModel?.lookAt) {
+        ;(vrmModel.lookAt as VRMLookAtSmoother).userTarget = null
+    }
+}
+
+function reattachCursorTarget() {
+    if (vrmModel?.lookAt && cursorTarget) {
+        ;(vrmModel.lookAt as VRMLookAtSmoother).userTarget = cursorTarget
+    }
+}
+
+/**
  * 页面可见性变化处理
  */
 function onVisibilityChange() {
@@ -820,6 +869,13 @@ onMounted(async () => {
         // 4. 创建 VRM 场景
         vrmScene = new THREE.Scene()
 
+        // Cursor-tracking target. Lives in the VRM scene so it sits in the
+        // same world space the avatar reads from.
+        cursorTarget = new THREE.Object3D()
+        cursorTarget.name = 'cursorLookTarget'
+        cursorTarget.position.set(vrmPosition.value.x, vrmPosition.value.y + props.cameraOffset, vrmPosition.value.z + 1)
+        vrmScene.add(cursorTarget)
+
         // 复用或创建背景平面材质
         if (!backgroundMaterial) {
             backgroundMaterial = new THREE.ShaderMaterial({
@@ -948,6 +1004,12 @@ onMounted(async () => {
 
         // 监听页面可见性变化
         document.addEventListener('visibilitychange', onVisibilityChange)
+
+        // Cursor lookAt
+        window.addEventListener('pointermove', onPointerMove, { passive: true })
+        window.addEventListener('pointerleave', releaseCursorTarget)
+        window.addEventListener('pointercancel', releaseCursorTarget)
+        window.addEventListener('pointerenter', reattachCursorTarget)
     } catch (error: any) {
         console.error('Failed to initialize Avatar component:', error)
         isLoading.value = false
@@ -966,6 +1028,11 @@ onUnmounted(() => {
     // 卸载事件
     window.removeEventListener('resize', onWindowResize)
     document.removeEventListener('visibilitychange', onVisibilityChange)
+    window.removeEventListener('pointermove', onPointerMove)
+    window.removeEventListener('pointerleave', releaseCursorTarget)
+    window.removeEventListener('pointercancel', releaseCursorTarget)
+    window.removeEventListener('pointerenter', reattachCursorTarget)
+    cursorTarget = null
 
     // 清理 Preloader Worker
     if (preloader) {
