@@ -82,7 +82,7 @@ const handleUserInteraction = async () => {
     // 移除事件监听
     document.removeEventListener('click', handleUserInteraction)
     document.removeEventListener('keydown', handleUserInteraction)
-    document.removeEventListener('mousestart', handleUserInteraction)
+    document.removeEventListener('pointerdown', handleUserInteraction)
     document.removeEventListener('touchend', handleUserInteraction)
 }
 
@@ -99,7 +99,7 @@ onMounted(() => {
     // 添加全局事件监听,等待用户交互后启动音乐
     document.addEventListener('click', handleUserInteraction, { once: false })
     document.addEventListener('keydown', handleUserInteraction, { once: false })
-    document.addEventListener('mousestart', handleUserInteraction, { once: false })
+    document.addEventListener('pointerdown', handleUserInteraction, { once: false })
     document.addEventListener('touchend', handleUserInteraction, { once: false })
 })
 
@@ -112,7 +112,7 @@ onBeforeUnmount(() => {
     // 移除事件监听（如果还未触发）
     document.removeEventListener('click', handleUserInteraction)
     document.removeEventListener('keydown', handleUserInteraction)
-    document.removeEventListener('mousestart', handleUserInteraction)
+    document.removeEventListener('pointerdown', handleUserInteraction)
     document.removeEventListener('touchend', handleUserInteraction)
 })
 </script>
@@ -156,8 +156,6 @@ onBeforeUnmount(() => {
                 </div>
             </div>
         </Transition>
-
-        <PointerOverlay />
     </div>
 </template>
 

@@ -7,6 +7,9 @@ import {
 } from '@pixiv/three-vrm-animation'
 import { VRMLookAtSmoother } from '@/avatar/libs/VRMLookAtSmootherLoaderPlugin/VRMLookAtSmoother'
 
+export type EmotionName = 'happy' | 'angry' | 'sad' | 'relaxed' | 'surprised'
+export const EMOTION_NAMES: EmotionName[] = ['happy', 'angry', 'sad', 'relaxed', 'surprised']
+
 export class VrmController {
     private _vrm: VRM | null
     private _animationMixer: THREE.AnimationMixer | null
@@ -24,6 +27,25 @@ export class VrmController {
     private _blinkDuration: number = 0.15 // 眨眼持续时间（秒）
     private _blinkIntervalMin: number = 2.0 // 最小眨眼间隔（秒）
     private _blinkIntervalMax: number = 6.0 // 最大眨眼间隔（秒）
+    // Track per-action mixer listeners so we can remove them on transition.
+    // Without this, LoopRepeat clips never fire 'finished' and the 'loop'
+    // listener stays bound forever — each playAction stacks more.
+    private _activeOnLoop: ((event: any) => void) | null = null
+    private _activeOnFinished: ((event: any) => void) | null = null
+
+    // Emotion blending state. Targets come from applyEmotion(); current values
+    // chase targets each frame for a smooth ramp. After _emotionDecayWindow
+    // seconds with no new emotion command, all targets ease back to 0 so the
+    // face doesn't stay stuck on the last emotion.
+    private _emotionTargets: Record<EmotionName, number> = {
+        happy: 0, angry: 0, sad: 0, relaxed: 0, surprised: 0,
+    }
+    private _emotionCurrent: Record<EmotionName, number> = {
+        happy: 0, angry: 0, sad: 0, relaxed: 0, surprised: 0,
+    }
+    private _emotionLastSetAt: number = 0
+    private _emotionSmoothing: number = 8.0
+    private _emotionDecayWindow: number = 4.0
 
     /**
      * 创建一个VrmController模型管理器
@@ -148,8 +170,10 @@ export class VrmController {
      * 清除VRM模型
      */
     clearVRM() {
+        this._detachActionListeners()
         this._vrm = null
         this._activeActionName = null
+        this._animationMixer = null
     }
 
     /**
@@ -187,6 +211,11 @@ export class VrmController {
             this._actions.get(this._activeActionName)?.fadeOut(transition)
         }
 
+        // Detach previous action's listeners. For LoopRepeat clips 'finished'
+        // never fires, so the 'loop' listener would stay bound and stack on
+        // every transition.
+        this._detachActionListeners()
+
         // 监听动画循环事件，每轮动画结束时调用callback
         const onLoop = () => {
             if (options.onLoop) {
@@ -195,8 +224,7 @@ export class VrmController {
         }
 
         const onFinished = () => {
-            animationMixer.removeEventListener('finished', onFinished)
-            animationMixer.removeEventListener('loop', onLoop)
+            this._detachActionListeners()
             this.endAction()
             if (options.onFinished) {
                 options.onFinished(vrm)
@@ -205,6 +233,8 @@ export class VrmController {
 
         animationMixer.addEventListener('finished', onFinished)
         animationMixer.addEventListener('loop', onLoop)
+        this._activeOnFinished = onFinished
+        this._activeOnLoop = onLoop
 
         // 播放新动作
         const action = this._actions.get(name)
@@ -238,6 +268,19 @@ export class VrmController {
         const transition = options.transition !== undefined ? options.transition : 0.5
         this._actions.get(this._activeActionName)?.fadeOut(transition)
         this._activeActionName = null
+        this._detachActionListeners()
+    }
+
+    private _detachActionListeners() {
+        if (!this._animationMixer) return
+        if (this._activeOnFinished) {
+            this._animationMixer.removeEventListener('finished', this._activeOnFinished)
+            this._activeOnFinished = null
+        }
+        if (this._activeOnLoop) {
+            this._animationMixer.removeEventListener('loop', this._activeOnLoop)
+            this._activeOnLoop = null
+        }
     }
 
     /**
@@ -351,6 +394,10 @@ export class VrmController {
         if (this._autoBlinkEnabled) {
             this._updateAutoBlink(delta)
         }
+
+        // Emotion tween + auto-decay. Must run before _updateBlendShapeNeutral
+        // so neutral fills in correctly each frame.
+        this._updateEmotions(delta)
 
         // 重置物理时间差阈值
         // 如果时间差过大，可能会导致物理效果出现较大抖动
@@ -583,13 +630,60 @@ export class VrmController {
         const expressionManager = this._vrm.expressionManager
         if (!expressionManager || !expressionManager.expressionMap.neutral) return
 
-        const angry = expressionManager.getValue('Angry') || 0
-        const happy = expressionManager.getValue('Happy') || 0
-        const relaxed = expressionManager.getValue('Relaxed') || 0
-        const sad = expressionManager.getValue('Sad') || 0
-        const surprised = expressionManager.getValue('Surprised') || 0
-
-        const neutral = Math.max(0, 1 - (angry + happy + relaxed + sad + surprised))
+        // VRM 1.0 preset names are lowercase. Earlier code read capitalized
+        // names which silently returned 0 — neutral was always 1 and emotion
+        // expressions visually had no effect.
+        let sum = 0
+        for (const name of EMOTION_NAMES) {
+            sum += expressionManager.getValue(name) || 0
+        }
+        const neutral = Math.max(0, 1 - sum)
         expressionManager.setValue('neutral', neutral)
+    }
+
+    /**
+     * Set the target emotion blend. Values not present default to 0, which
+     * means "decay this back to neutral." Values are clamped to [0, 1].
+     * Pass an empty object to reset to fully neutral.
+     */
+    applyEmotion(target: Partial<Record<EmotionName, number>>) {
+        for (const name of EMOTION_NAMES) {
+            const v = target[name]
+            this._emotionTargets[name] = v === undefined ? 0 : Math.max(0, Math.min(1, v))
+        }
+        this._emotionLastSetAt = performance.now()
+    }
+
+    /**
+     * Configure emotion tween responsiveness and how long after the last
+     * applyEmotion() before the face decays back to neutral.
+     */
+    setEmotionDynamics(opts: { smoothing?: number; decayWindowSeconds?: number }) {
+        if (opts.smoothing !== undefined) this._emotionSmoothing = opts.smoothing
+        if (opts.decayWindowSeconds !== undefined) this._emotionDecayWindow = opts.decayWindowSeconds
+    }
+
+    private _updateEmotions(delta: number) {
+        if (!this._vrm || !this._vrm.expressionManager) return
+        const expressionManager = this._vrm.expressionManager
+
+        // Auto-decay: after the idle window, ramp targets back to 0.
+        if (this._emotionLastSetAt > 0) {
+            const sinceLast = (performance.now() - this._emotionLastSetAt) / 1000
+            if (sinceLast > this._emotionDecayWindow) {
+                for (const name of EMOTION_NAMES) this._emotionTargets[name] = 0
+            }
+        }
+
+        // Tween current → target with a frame-rate-independent smoothing factor.
+        const k = 1 - Math.exp(-this._emotionSmoothing * delta)
+        for (const name of EMOTION_NAMES) {
+            const next = this._emotionCurrent[name] + (this._emotionTargets[name] - this._emotionCurrent[name]) * k
+            this._emotionCurrent[name] = next
+            // Only write if the model actually has the preset, to avoid spurious warnings.
+            if (expressionManager.expressionMap[name]) {
+                expressionManager.setValue(name, next)
+            }
+        }
     }
 }

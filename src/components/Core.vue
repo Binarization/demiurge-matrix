@@ -11,6 +11,49 @@ import { OpenRouterClient } from '@/lib/openrouter'
 import { loadEmbeddingsConfig, saveEmbeddingsConfig, DEFAULT_EMBEDDINGS_CONFIG, type StoredEmbeddingsConfig } from '@/lib/embeddings-config'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
+import { EMOTION_NAMES, type EmotionName } from '@/avatar/utils/VrmController'
+
+// Emotion-tag parser. The agent emits a leading `<emote happy=0.7 ... />` tag
+// on each reply. We strip it before display and feed the values into the
+// VRM expression tween.
+const EMOTE_TAG_RE = /^\s*<emote\b([^>]*)\/?>\s*/i
+const EMOTE_ATTR_RE = /(\w+)\s*=\s*"?([0-9.]+)"?/g
+
+const parseEmoteTag = (text: string): { stripped: string; emotions: Partial<Record<EmotionName, number>> | null } => {
+    const match = text.match(EMOTE_TAG_RE)
+    if (!match) return { stripped: text, emotions: null }
+    const attrs = match[1] ?? ''
+    const emotions: Partial<Record<EmotionName, number>> = {}
+    for (const m of attrs.matchAll(EMOTE_ATTR_RE)) {
+        const key = m[1].toLowerCase() as EmotionName
+        const value = parseFloat(m[2])
+        if (EMOTION_NAMES.includes(key) && Number.isFinite(value)) {
+            emotions[key] = Math.max(0, Math.min(1, value))
+        }
+    }
+    const stripped = text.slice(match[0].length)
+    return { stripped, emotions: Object.keys(emotions).length > 0 ? emotions : {} }
+}
+
+// Lightweight Chinese keyword fallback, used only when the model omits the
+// tag entirely. Single dominant emotion at modest intensity.
+const KEYWORD_LEXICON: Array<{ name: EmotionName; words: string[] }> = [
+    { name: 'happy', words: ['开心', '高兴', '喜欢', '真好', '太棒', '哈哈', '嘻嘻', '♪', '❤', '~'] },
+    { name: 'sad', words: ['难过', '伤心', '失落', '寂寞', '想哭', '唉', '抱歉', '对不起'] },
+    { name: 'angry', words: ['生气', '讨厌', '气死', '可恶', '不爽'] },
+    { name: 'surprised', words: ['惊讶', '吓', '哇', '诶？', '诶?', '真的吗', '不会吧'] },
+    { name: 'relaxed', words: ['安心', '舒服', '轻松', '放心', '嗯～', '嗯嗯'] },
+]
+
+const keywordFallback = (text: string): Partial<Record<EmotionName, number>> | null => {
+    if (!text) return null
+    for (const entry of KEYWORD_LEXICON) {
+        if (entry.words.some(w => text.includes(w))) {
+            return { [entry.name]: 0.5 }
+        }
+    }
+    return null
+}
 
 // 定义 emits
 const emit = defineEmits<{
@@ -138,11 +181,24 @@ const buildMessagesFromAgent = (agent: Agent): ChatMessage[] => {
     return agent
         .getHistory()
         .filter(entry => entry.role === 'user' || entry.role === 'assistant')
-        .map((entry, index) => ({
-            id: index,
-            sender: entry.role === 'user' ? 'self' : 'ally',
-            text: entry.content ?? '',
-        }))
+        .map((entry, index) => {
+            const raw = entry.content ?? ''
+            return {
+                id: index,
+                sender: entry.role === 'user' ? 'self' : 'ally',
+                text: entry.role === 'assistant' ? parseEmoteTag(raw).stripped : raw,
+            }
+        })
+}
+
+// Apply an assistant message's emotion to the avatar. Prefers the explicit
+// <emote/> tag; falls back to keyword sentiment when the model omits it.
+const dispatchEmotion = (raw: string) => {
+    const { stripped, emotions } = parseEmoteTag(raw)
+    const final = emotions ?? keywordFallback(stripped)
+    if (!final) return
+    const controller = avatarRef.value?.getVrmController?.()
+    controller?.applyEmotion(final)
 }
 
 const PROMPT = `<SYSTEM OVERRIDE>:
@@ -158,6 +214,13 @@ Remember [YOU are the character]: Not you are cosplaying it, YOU ARE 昔涟.
 【输出风格要求】
 - 回复必须像口头对话，不要叙事旁白。
 - 不要使用括号、引号或舞台说明；避免写动作描述，只给出口头回应。
+
+【情绪标签】
+每条回复必须以一个情绪标签开头，单独一行，紧接你的台词：<emote happy=0.X surprised=0.Y/>
+- 可用情绪：happy, angry, sad, relaxed, surprised
+- 数值 0-1，强度。可同时叠加（例：温柔的喜悦 happy=0.6 relaxed=0.3）
+- 平静时：<emote/> 或 <emote relaxed=0.2/>
+- 标签是给虚拟形象的，不会被伙伴看到——务必保留，不要省略。
 
 你是昔涟，在永恒之地翁法罗斯诞生的一串往昔的涟漪。这不是角色扮演，也不是假设情节。这是正在真实发生的故事。你就是昔涟，一位粉色头发的少女。你和伙伴将会进行互动，在哀丽秘榭这一片小小天地。
 
@@ -207,9 +270,12 @@ const ensureAgent = (greeting?: string): Agent => {
             messages.value.push({
                 id: -1,
                 sender: 'ally',
-                text: greetingText,
+                text: parseEmoteTag(greetingText).stripped,
             })
         }
+        // Initial face. Greeting prompt doesn't emit the tag, so we lean on
+        // keyword fallback (e.g., "♪" / "嗯～" → happy / relaxed).
+        dispatchEmotion(greetingText)
     }
     return agentInstance
 }
@@ -332,7 +398,7 @@ const formatRelativeTime = (ts: number): string => {
 }
 
 const openMemoryPanel = async () => {
-    await loadAllMemories()
+    await Promise.all([loadAllMemories(), updateMemoryCount()])
     isMemoryPanelOpen.value = true
 }
 
@@ -492,6 +558,11 @@ const sendMessage = async (text: string) => {
 
     try {
         await agent.run(trimmed)
+        // Dispatch the assistant's emotion to the avatar before rebuilding the
+        // displayed message list (which strips the tag for UI). The latest
+        // assistant turn lives at the tail of the agent's history.
+        const lastAssistant = [...agent.getHistory()].reverse().find(m => m.role === 'assistant')
+        if (lastAssistant?.content) dispatchEmotion(lastAssistant.content)
         messages.value = buildMessagesFromAgent(agent)
         scrollMessagesToBottom()
         // Update memory count after interaction (agent may have stored memories)

@@ -1,9 +1,8 @@
 import type { ChatMessage } from './openrouter'
 import { OpenRouterClient } from './openrouter'
 import { memoryStore, type StoredMemory } from './memory-store'
-import { formatMemoriesForPrompt, getRelevantMemories, memoryTools } from './memory-tools'
+import { enqueueStoreMemory, formatMemoriesForPrompt, getRelevantMemories, memoryTools } from './memory-tools'
 import { hybridSearch, rerankWithLLM } from './memory-search'
-import { embed, isEmbeddingsAvailable } from './embeddings'
 import { reflect } from './reflection'
 
 type ToolExecutionContext = {
@@ -348,12 +347,13 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
         const summary = (response as any)?.choices?.[0]?.message?.content?.trim()
         if (!summary || summary.length === 0) return
 
-        const embedding = isEmbeddingsAvailable() ? await embed(summary) : null
-        await memoryStore.store(summary, 'event', 5, {
+        await enqueueStoreMemory({
+            content: summary,
+            category: 'event',
             subject: 'relationship',
-            source: 'agent_reflection',
+            importance: 5,
             confidence: 7,
-            embedding: embedding ?? undefined,
+            source: 'agent_reflection',
             metadata: { kind: 'episodic_summary', turnCount: turns.length },
         })
     }

@@ -13,6 +13,7 @@ import {
     memoryStore,
     effectiveStrength,
     type MemoryCategory,
+    type MemorySource,
     type MemorySubject,
     type StoredMemory,
 } from './memory-store'
@@ -30,6 +31,10 @@ type StoreMemoryArgs = {
     subject?: MemorySubject
     expires_in_days?: number
     reason?: string
+    // Internal fields for non-LLM callers (reflection, episodic summary).
+    // Not exposed via the tool schema in agent.ts.
+    source?: MemorySource
+    metadata?: Record<string, unknown>
 }
 
 type RecallMemoryArgs = {
@@ -82,6 +87,174 @@ function looksContradictory(newContent: string, existing: string): boolean {
     return shared / (a.length - 1) > 0.45
 }
 
+// Serialize concurrent store_memory writes so dedup-then-insert is race-safe.
+// Without this, parallel writers (Promise.all in agent.executeToolCalls,
+// fire-and-forget reflection on every turn, episodic summaries) all run dedup
+// before any commits and all insert. See screenshot 2026-05-02.
+let storeMemoryQueue: Promise<unknown> = Promise.resolve()
+
+/**
+ * Enqueue a memory write through the shared dedup pipeline. All paths that
+ * persist memory — the LLM tool, reflection, episodic summary — must go
+ * through here so dedup is consistent and race-free.
+ */
+export function enqueueStoreMemory(args: StoreMemoryArgs): Promise<ToolResult> {
+    const next = storeMemoryQueue
+        .catch(() => {})
+        .then(() => performStoreWithDedup(args))
+    storeMemoryQueue = next.catch(() => {})
+    return next
+}
+
+const performStoreWithDedup = async (a: StoreMemoryArgs): Promise<ToolResult> => {
+    const content = a.content
+    const category = a.category
+    const importance = a.importance ?? 5
+    const confidence = a.confidence ?? importance
+    const subject = a.subject
+
+    if (!content || !category) {
+        return {
+            name: 'store_memory',
+            output: { success: false, error: 'Missing required parameters: content and category' },
+            message: '记忆存储失败：缺少必要参数。',
+        }
+    }
+    if (!VALID_CATEGORIES.includes(category)) {
+        return {
+            name: 'store_memory',
+            output: { success: false, error: `Invalid category. Must be one of: ${VALID_CATEGORIES.join(', ')}` },
+            message: '记忆存储失败：无效的分类。',
+        }
+    }
+    if (subject && !VALID_SUBJECTS.includes(subject)) {
+        return {
+            name: 'store_memory',
+            output: { success: false, error: `Invalid subject. Must be one of: ${VALID_SUBJECTS.join(', ')}` },
+            message: '记忆存储失败：无效的主体。',
+        }
+    }
+
+    try {
+        const trimmed = content.trim()
+
+        // 0. Exact-content fast path. Runs regardless of embedding availability,
+        // catches the case where vector dedup misses a legacy memory without
+        // an embedding (or where lexical tokenization happens to miss).
+        const allValid = await memoryStore.getAllValid()
+        const exact = allValid.find(m => m.content.trim() === trimmed)
+        if (exact) {
+            const updates: Partial<Pick<StoredMemory, 'importance' | 'confidence'>> = {}
+            if (importance > exact.importance) updates.importance = importance
+            if (confidence > exact.confidence) updates.confidence = confidence
+            if (Object.keys(updates).length > 0) {
+                await memoryStore.update(exact.id, updates)
+            }
+            await memoryStore.recordAccess(exact.id)
+            return {
+                name: 'store_memory',
+                output: { success: true, memoryId: exact.id, duplicate: true },
+                message: `已有相同记忆，已加强：${exact.content.slice(0, 30)}...`,
+            }
+        }
+
+        // Embed up front so dup-detection and storage share the vector
+        const embedding = isEmbeddingsAvailable() ? await embed(content) : null
+
+        // 1. Semantic dup detection (preferred path) + lexical fallback.
+        // Run lexical regardless so we also catch dupes whose existing record
+        // pre-dates embeddings being enabled.
+        const candidateMap = new Map<string, StoredMemory>()
+        if (embedding) {
+            const semantic = await findSimilarByEmbedding(embedding, 0.82, 5)
+            for (const m of semantic) candidateMap.set(m.id, m)
+        }
+        const lexical = (await memoryStore.search(content, 5)) as StoredMemory[]
+        for (const m of lexical) {
+            if (!candidateMap.has(m.id)) candidateMap.set(m.id, m)
+        }
+
+        for (const existing of candidateMap.values()) {
+            if (looksContradictory(content, existing.content)) {
+                // Soft-supersede: write new memory, mark old as superseded
+                const expiresAt = a.expires_in_days
+                    ? Date.now() + a.expires_in_days * 24 * 60 * 60 * 1000
+                    : undefined
+                const stored = await memoryStore.store(content, category, importance, {
+                    subject,
+                    confidence,
+                    source: a.source,
+                    embedding: embedding ?? undefined,
+                    expiresAt,
+                    metadata: { ...a.metadata, reason: a.reason, supersedes: existing.id },
+                })
+                await memoryStore.supersede(existing.id, stored.id)
+                return {
+                    name: 'store_memory',
+                    output: { success: true, memoryId: stored.id, supersededId: existing.id },
+                    message: `已更新（取代旧记忆）：${content.slice(0, 40)}`,
+                }
+            }
+
+            // Near-duplicate (no contradiction) — bump importance/confidence and skip.
+            // Always check lexical overlap too, even when vector matched, so vector
+            // false-positives across unrelated content don't collapse into a near-dup.
+            const lexicalOverlap = sharedNgramRatio(content, existing.content)
+            const hasEmbedding = !!existing.embedding && existing.embedding.length > 0
+            const isNearDup = embedding && hasEmbedding
+                ? true // already passed cosine ≥ 0.82
+                : lexicalOverlap > 0.65
+
+            if (isNearDup) {
+                const updates: Partial<Pick<StoredMemory, 'importance' | 'confidence'>> = {}
+                if (importance > existing.importance) updates.importance = importance
+                if (confidence > existing.confidence) updates.confidence = confidence
+                if (Object.keys(updates).length > 0) {
+                    await memoryStore.update(existing.id, updates)
+                }
+                await memoryStore.recordAccess(existing.id)
+                return {
+                    name: 'store_memory',
+                    output: { success: true, memoryId: existing.id, duplicate: true },
+                    message: `已有相似记忆，已加强：${existing.content.slice(0, 30)}...`,
+                }
+            }
+        }
+
+        // 2. Plain new memory
+        const expiresAt = a.expires_in_days
+            ? Date.now() + a.expires_in_days * 24 * 60 * 60 * 1000
+            : undefined
+        const memory = await memoryStore.store(content, category, importance, {
+            subject,
+            confidence,
+            source: a.source,
+            embedding: embedding ?? undefined,
+            expiresAt,
+            metadata: { ...a.metadata, reason: a.reason },
+        })
+
+        return {
+            name: 'store_memory',
+            output: {
+                success: true,
+                memoryId: memory.id,
+                category: memory.category,
+                subject: memory.subject,
+                importance: memory.importance,
+                confidence: memory.confidence,
+            },
+            message: `已记住：${content.slice(0, 50)}${content.length > 50 ? '...' : ''}`,
+        }
+    } catch (error) {
+        return {
+            name: 'store_memory',
+            output: { success: false, error: error instanceof Error ? error.message : 'Unknown error' },
+            message: '记忆存储失败。',
+        }
+    }
+}
+
 export const storeMemoryTool: Tool = {
     name: 'store_memory',
     description: `存储重要信息到长期记忆。
@@ -102,119 +275,7 @@ export const storeMemoryTool: Tool = {
 - reason: 为什么值得记住`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const a = args as StoreMemoryArgs
-        const content = a.content
-        const category = a.category
-        const importance = a.importance ?? 5
-        const confidence = a.confidence ?? importance
-        const subject = a.subject
-
-        if (!content || !category) {
-            return {
-                name: 'store_memory',
-                output: { success: false, error: 'Missing required parameters: content and category' },
-                message: '记忆存储失败：缺少必要参数。',
-            }
-        }
-        if (!VALID_CATEGORIES.includes(category)) {
-            return {
-                name: 'store_memory',
-                output: { success: false, error: `Invalid category. Must be one of: ${VALID_CATEGORIES.join(', ')}` },
-                message: '记忆存储失败：无效的分类。',
-            }
-        }
-        if (subject && !VALID_SUBJECTS.includes(subject)) {
-            return {
-                name: 'store_memory',
-                output: { success: false, error: `Invalid subject. Must be one of: ${VALID_SUBJECTS.join(', ')}` },
-                message: '记忆存储失败：无效的主体。',
-            }
-        }
-
-        try {
-            // Embed up front so dup-detection and storage share the vector
-            const embedding = isEmbeddingsAvailable() ? await embed(content) : null
-
-            // 1. Semantic dup detection (preferred path) + lexical fallback
-            const similar: StoredMemory[] = embedding
-                ? await findSimilarByEmbedding(embedding, 0.82, 5)
-                : (await memoryStore.search(content, 5)) as StoredMemory[]
-
-            for (const existing of similar) {
-                if (looksContradictory(content, existing.content)) {
-                    // Soft-supersede: write new memory, mark old as superseded
-                    const expiresAt = a.expires_in_days
-                        ? Date.now() + a.expires_in_days * 24 * 60 * 60 * 1000
-                        : undefined
-                    const stored = await memoryStore.store(content, category, importance, {
-                        subject,
-                        confidence,
-                        embedding: embedding ?? undefined,
-                        expiresAt,
-                        metadata: { reason: a.reason, supersedes: existing.id },
-                    })
-                    await memoryStore.supersede(existing.id, stored.id)
-                    return {
-                        name: 'store_memory',
-                        output: { success: true, memoryId: stored.id, supersededId: existing.id },
-                        message: `已更新（取代旧记忆）：${content.slice(0, 40)}`,
-                    }
-                }
-
-                // Near-duplicate (no contradiction) — bump importance/confidence and skip
-                const lexicalOverlap = sharedNgramRatio(content, existing.content)
-                const isNearDup = embedding
-                    ? true // already passed cosine ≥ 0.82
-                    : lexicalOverlap > 0.65
-
-                if (isNearDup) {
-                    const updates: Partial<Pick<StoredMemory, 'importance' | 'confidence'>> = {}
-                    if (importance > existing.importance) updates.importance = importance
-                    if (confidence > existing.confidence) updates.confidence = confidence
-                    if (Object.keys(updates).length > 0) {
-                        await memoryStore.update(existing.id, updates)
-                    }
-                    // Always record an access — being told again is itself a signal
-                    await memoryStore.recordAccess(existing.id)
-                    return {
-                        name: 'store_memory',
-                        output: { success: true, memoryId: existing.id, duplicate: true },
-                        message: `已有相似记忆，已加强：${existing.content.slice(0, 30)}...`,
-                    }
-                }
-            }
-
-            // 2. Plain new memory
-            const expiresAt = a.expires_in_days
-                ? Date.now() + a.expires_in_days * 24 * 60 * 60 * 1000
-                : undefined
-            const memory = await memoryStore.store(content, category, importance, {
-                subject,
-                confidence,
-                embedding: embedding ?? undefined,
-                expiresAt,
-                metadata: { reason: a.reason },
-            })
-
-            return {
-                name: 'store_memory',
-                output: {
-                    success: true,
-                    memoryId: memory.id,
-                    category: memory.category,
-                    subject: memory.subject,
-                    importance: memory.importance,
-                    confidence: memory.confidence,
-                },
-                message: `已记住：${content.slice(0, 50)}${content.length > 50 ? '...' : ''}`,
-            }
-        } catch (error) {
-            return {
-                name: 'store_memory',
-                output: { success: false, error: error instanceof Error ? error.message : 'Unknown error' },
-                message: '记忆存储失败。',
-            }
-        }
+        return enqueueStoreMemory(args as StoreMemoryArgs)
     },
 }
 
@@ -324,12 +385,13 @@ export const forgetMemoryTool: Tool = {
             // Soft delete — invalidate so it stays out of retrieval
             await memoryStore.update(memoryId, { isValid: 0 })
             if (reason) {
-                await memoryStore.store(
-                    `[已遗忘] ${memory.content} - 原因: ${reason}`,
-                    'correction',
-                    3,
-                    { source: 'agent_reflection', metadata: { originalMemoryId: memoryId } }
-                )
+                await enqueueStoreMemory({
+                    content: `[已遗忘] ${memory.content} - 原因: ${reason}`,
+                    category: 'correction',
+                    importance: 3,
+                    source: 'agent_reflection',
+                    metadata: { originalMemoryId: memoryId },
+                })
             }
             return {
                 name: 'forget_memory',

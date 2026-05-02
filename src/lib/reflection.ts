@@ -11,9 +11,8 @@
  */
 
 import type { OpenRouterClient } from './openrouter'
-import { memoryStore, type MemoryCategory, type MemorySubject } from './memory-store'
-import { embed, isEmbeddingsAvailable } from './embeddings'
-import { findSimilarByEmbedding } from './memory-search'
+import { type MemoryCategory, type MemorySubject } from './memory-store'
+import { enqueueStoreMemory } from './memory-tools'
 
 export type ReflectionInput = {
     userMessage: string
@@ -95,8 +94,6 @@ export type ReflectionOptions = {
     client: OpenRouterClient
     /** Cheap model used for extraction. Defaults to whatever the client is set to. */
     model?: string
-    /** Skip writing if a similar memory already exists (cosine ≥ this). */
-    similarityThreshold?: number
 }
 
 /**
@@ -128,33 +125,25 @@ export async function reflect(input: ReflectionInput, options: ReflectionOptions
     if (extracted.length === 0) return []
 
     const created: string[] = []
-    const threshold = options.similarityThreshold ?? 0.85
-    const embedAvailable = isEmbeddingsAvailable()
 
     for (const item of extracted) {
-        // Optional dedup by embedding similarity
-        let embedding: number[] | null = null
-        if (embedAvailable) {
-            embedding = await embed(item.content)
-            if (embedding) {
-                const similar = await findSimilarByEmbedding(embedding, threshold, 1)
-                if (similar.length > 0) continue // Skip — already remembered
-            }
-        }
-
-        const expiresAt = item.expires_in_days
-            ? Date.now() + item.expires_in_days * 24 * 60 * 60 * 1000
-            : undefined
-
+        // Route through the shared dedup queue so reflection writes don't
+        // collide with concurrent tool/episodic writes and can't bypass
+        // exact-content / lexical / semantic dedup.
         try {
-            const stored = await memoryStore.store(item.content, item.category, item.importance, {
+            const result = await enqueueStoreMemory({
+                content: item.content,
+                category: item.category,
                 subject: item.subject,
+                importance: item.importance,
                 confidence: item.confidence,
+                expires_in_days: item.expires_in_days,
                 source: 'agent_reflection',
-                embedding: embedding ?? undefined,
-                expiresAt,
             })
-            created.push(stored.id)
+            const out = result.output as { success?: boolean; memoryId?: string; duplicate?: boolean }
+            if (out.success && out.memoryId && !out.duplicate) {
+                created.push(out.memoryId)
+            }
         } catch (err) {
             console.warn('[reflection] store failed:', err)
         }
