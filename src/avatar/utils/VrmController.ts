@@ -390,15 +390,6 @@ export class VrmController {
             }
         }
 
-        // 更新自动眨眼
-        if (this._autoBlinkEnabled) {
-            this._updateAutoBlink(delta)
-        }
-
-        // Emotion tween + auto-decay. Must run before _updateBlendShapeNeutral
-        // so neutral fills in correctly each frame.
-        this._updateEmotions(delta)
-
         // 重置物理时间差阈值
         // 如果时间差过大，可能会导致物理效果出现较大抖动
         const resetSpringBoneDeltaThreshold = 0.5
@@ -412,8 +403,18 @@ export class VrmController {
             })
         }
 
+        // Order matters. The VRMA clip may carry baked expression tracks
+        // (philia/等待.vrma writes sad + blink + oh every frame). The mixer
+        // must run first; auto-blink + emotion + neutral all run after so
+        // their writes are the ones the renderer sees.
         this._animationMixer.update(delta)
+
+        if (this._autoBlinkEnabled) {
+            this._updateAutoBlink(delta)
+        }
+        this._updateEmotions(delta)
         this._updateBlendShapeNeutral()
+
         this._vrm.update(delta)
     }
 
