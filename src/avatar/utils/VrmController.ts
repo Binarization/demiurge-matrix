@@ -47,6 +47,18 @@ export class VrmController {
     private _emotionSmoothing: number = 8.0
     private _emotionDecayWindow: number = 4.0
 
+    // Generic per-expression tween. Lets callers ramp any expression smoothly
+    // (e.g. mouth shapes for visemes, custom expressions). Each tween is
+    // ticked every frame after the mixer; instant setExpression() drops any
+    // pending tween for the same name so the immediate write wins.
+    private _expressionTweens: Map<string, { current: number; target: number; smoothing: number }> = new Map()
+
+    // Per-action: does the underlying clip drive blink expressions? Used to
+    // auto-arbitrate between auto-blink and clip-baked blinks so the two
+    // don't both fight for the eyelids each frame.
+    private _actionHasBlinks: Map<string, boolean> = new Map()
+    private _autoBlinkPolicy: 'auto' | 'always' | 'never' = 'auto'
+
     /**
      * 创建一个VrmController模型管理器
      * @param vrm VRM模型
@@ -74,20 +86,18 @@ export class VrmController {
     }
 
     /**
-     * 启用自动眨眼
+     * 启用自动眨眼。Forces always-on regardless of clip; if you want
+     * clip-aware behaviour, prefer setAutoBlinkPolicy('auto').
      */
     enableAutoBlink() {
-        this._autoBlinkEnabled = true
-        this._resetBlinkTimer()
+        this.setAutoBlinkPolicy('always')
     }
 
     /**
-     * 禁用自动眨眼
+     * 禁用自动眨眼。
      */
     disableAutoBlink() {
-        this._autoBlinkEnabled = false
-        this._isBlinking = false
-        this._blinkProgress = 0
+        this.setAutoBlinkPolicy('never')
     }
 
     /**
@@ -247,6 +257,8 @@ export class VrmController {
         action.play()
         action.fadeIn(transition)
         this._activeActionName = name
+        // The new clip's blink ownership decides auto-blink under 'auto' policy.
+        this._reconcileAutoBlink()
         if (options.resetSpringBones || transition === 0) {
             requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
@@ -269,6 +281,7 @@ export class VrmController {
         this._actions.get(this._activeActionName)?.fadeOut(transition)
         this._activeActionName = null
         this._detachActionListeners()
+        this._reconcileAutoBlink()
     }
 
     private _detachActionListeners() {
@@ -320,6 +333,19 @@ export class VrmController {
 
         animationAction.clampWhenFinished = true
         this._actions.set(name, animationAction)
+
+        // Detect baked blink tracks. The generated AnimationClip uses
+        // resolved-uuid track names, so read straight from the parsed VRMA
+        // metadata. expressionTracks.preset is a Map<presetName, Track>.
+        const presetTracks = (animation as any).expressionTracks?.preset
+        const hasBlink = !!(
+            presetTracks && (
+                presetTracks.has?.('blink') ||
+                presetTracks.has?.('blinkLeft') ||
+                presetTracks.has?.('blinkRight')
+            )
+        )
+        this._actionHasBlinks.set(name, hasBlink)
     }
 
     /**
@@ -331,6 +357,7 @@ export class VrmController {
         if (action) {
             action.stop()
             this._actions.delete(name)
+            this._actionHasBlinks.delete(name)
         } else {
             throw new Error(`Animation ${name} does not exist`)
         }
@@ -405,14 +432,15 @@ export class VrmController {
 
         // Order matters. The VRMA clip may carry baked expression tracks
         // (philia/等待.vrma writes sad + blink + oh every frame). The mixer
-        // must run first; auto-blink + emotion + neutral all run after so
-        // their writes are the ones the renderer sees.
+        // must run first; auto-blink + emotion + tweens + neutral all run
+        // after so their writes are the ones the renderer sees.
         this._animationMixer.update(delta)
 
         if (this._autoBlinkEnabled) {
             this._updateAutoBlink(delta)
         }
         this._updateEmotions(delta)
+        this._updateExpressionTweens(delta)
         this._updateBlendShapeNeutral()
 
         this._vrm.update(delta)
@@ -459,7 +487,8 @@ export class VrmController {
     }
 
     /**
-     * 设置表情
+     * 设置表情。Instant write — drops any pending soft-tween for this name
+     * so the caller's snap value isn't immediately overridden by the tween.
      * @param name 表情名称
      * @param value 表情值
      * @param isBinary 是否为二进制表情
@@ -474,7 +503,82 @@ export class VrmController {
         const expressionManager = this._vrm.expressionManager
         if (!expressionManager) return
 
+        this._expressionTweens.delete(name)
         expressionManager.setValue(name, value)
+    }
+
+    /**
+     * Smoothly ramp an expression toward `target`. Frame-rate-independent
+     * exponential decay; ~150ms to settle at smoothing=8.0. Replaces any
+     * pending tween for the same name (target updates, current preserved
+     * so motion is continuous).
+     */
+    setExpressionSmooth(name: string, target: number, smoothing: number = 8.0) {
+        if (!this._vrm || !this._vrm.expressionManager) return
+        const clamped = Math.max(0, Math.min(1, target))
+        const existing = this._expressionTweens.get(name)
+        if (existing) {
+            existing.target = clamped
+            existing.smoothing = smoothing
+        } else {
+            const current = this._vrm.expressionManager.getValue(name) ?? 0
+            this._expressionTweens.set(name, { current, target: clamped, smoothing })
+        }
+    }
+
+    private _updateExpressionTweens(delta: number) {
+        if (!this._vrm || !this._vrm.expressionManager) return
+        const expressionManager = this._vrm.expressionManager
+        for (const [name, tween] of this._expressionTweens) {
+            const k = 1 - Math.exp(-tween.smoothing * delta)
+            tween.current += (tween.target - tween.current) * k
+            if (expressionManager.expressionMap[name]) {
+                expressionManager.setValue(name, tween.current)
+            }
+            // Drop tweens that have effectively settled to keep the loop tight.
+            if (Math.abs(tween.target - tween.current) < 1e-4) {
+                tween.current = tween.target
+                if (expressionManager.expressionMap[name]) {
+                    expressionManager.setValue(name, tween.current)
+                }
+                if (tween.target === 0) this._expressionTweens.delete(name)
+            }
+        }
+    }
+
+    /**
+     * Decide whether auto-blink runs.
+     * - 'auto' (default): mirror whether the active clip has its own blink tracks.
+     * - 'always' / 'never': explicit override.
+     */
+    setAutoBlinkPolicy(policy: 'auto' | 'always' | 'never') {
+        this._autoBlinkPolicy = policy
+        this._reconcileAutoBlink()
+    }
+
+    private _reconcileAutoBlink() {
+        if (this._autoBlinkPolicy === 'always') {
+            this._autoBlinkEnabled = true
+            this._resetBlinkTimer()
+            return
+        }
+        if (this._autoBlinkPolicy === 'never') {
+            this._autoBlinkEnabled = false
+            this._isBlinking = false
+            this._blinkProgress = 0
+            return
+        }
+        // auto: drive from active clip's blink presence.
+        const clipHasBlinks = this._activeActionName ? !!this._actionHasBlinks.get(this._activeActionName) : false
+        const shouldEnable = !clipHasBlinks
+        if (shouldEnable && !this._autoBlinkEnabled) {
+            this._autoBlinkEnabled = true
+            this._resetBlinkTimer()
+        } else if (!shouldEnable && this._autoBlinkEnabled) {
+            this._autoBlinkEnabled = false
+            this._isBlinking = false
+            this._blinkProgress = 0
+        }
     }
 
     /**
@@ -588,40 +692,6 @@ export class VrmController {
         }
     }
 
-    /**
-     * 启用表情动画
-     */
-    enableExpressionAnimation() {
-        // 尚未实现
-        // this._isEnabledExpression = true
-        // this._refreshAnimation()
-    }
-
-    /**
-     * 禁用表情动画
-     */
-    disableExpressionAnimation() {
-        // 尚未实现
-        // this._isEnabledExpression = false
-        // this._refreshAnimation()
-    }
-
-    /**
-     * 更新动画
-     */
-    private _refreshAnimation() {
-        if (this._activeActionName) {
-            const action = this._actions.get(this._activeActionName)
-            const options = {
-                loop: action?.loop === THREE.LoopRepeat,
-                transition: 0,
-                startTime: action?.time || 0,
-                paused: action?.paused || false,
-                resetSpringBones: false,
-            }
-            this.playAction(this._activeActionName, options)
-        }
-    }
 
     /**
      * 更新中性表情
