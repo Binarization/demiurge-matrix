@@ -1,16 +1,16 @@
 /**
  * IndexedDB-based long-term memory storage for the Agent
  *
- * Features:
- * - Full-text search with Flexsearch (Chinese + English support)
- * - Memory categories (fact, preference, event, correction)
- * - Importance scoring for selective recall
- * - Automatic cleanup of stale/incorrect memories
+ * v3 schema:
+ *   - Hybrid retrieval-ready: stores optional embedding vectors alongside content
+ *   - Continuous decay: effectiveStrength() replaces brittle cleanup heuristics
+ *   - Two-dimensional taxonomy: category (type) + subject (about whom)
+ *   - Soft contradictions: supersededBy + confidence rather than hard delete
+ *   - Time-bound memories: expiresAt for promises/plans
  */
 
 import { Index } from 'flexsearch'
 
-// Type declaration for Intl.Segmenter (available in modern browsers)
 declare global {
     namespace Intl {
         interface SegmenterOptions {
@@ -32,90 +32,110 @@ declare global {
 }
 
 export type MemoryCategory = 'fact' | 'preference' | 'event' | 'correction' | 'context'
+export type MemorySubject = 'user' | 'character' | 'world' | 'relationship' | 'other'
+export type MemorySource = 'user_explicit' | 'inferred' | 'agent_reflection'
 
 export type StoredMemory = {
     id: string
     content: string
     category: MemoryCategory
-    importance: number // 1-10 scale
-    keywords: string[] // For search optimization
+    subject: MemorySubject
+    source: MemorySource
+    importance: number // 1-10
+    confidence: number // 1-10 (separate from importance: how sure we are)
     createdAt: number
     lastAccessedAt: number
     accessCount: number
-    isValid: number // 1 = valid, 0 = invalid (using number for IndexedDB compatibility)
-    date: string // Storage date in yyyy-mm-dd format
+    isValid: number // 1 = valid, 0 = invalid
+    date: string // yyyy-mm-dd
+    embedding?: number[] // optional dense vector
+    supersededBy?: string // id of memory that replaced this
+    relatedIds?: string[] // soft links
+    expiresAt?: number // unix ms; memory inert past this
     metadata?: Record<string, unknown>
 }
 
 export type MemorySearchResult = StoredMemory & {
     relevanceScore: number
+    lexicalScore?: number
+    vectorScore?: number
+    strength?: number
 }
 
 const DB_NAME = 'demiurge_memory'
-const DB_VERSION = 2 // Bumped version to handle schema change
+const DB_VERSION = 3
 const STORE_NAME = 'memories'
+const DAY_MS = 24 * 60 * 60 * 1000
+
+// Category-specific half-life in days. Facts decay slowly; context decays fast.
+const HALF_LIFE_DAYS: Record<MemoryCategory, number> = {
+    fact: 365,
+    preference: 180,
+    event: 90,
+    correction: 365,
+    context: 30,
+}
 
 /**
- * Chinese text tokenizer for Flexsearch
- * Uses Intl.Segmenter for proper Chinese word segmentation (分词)
- * Falls back to character-by-character for older browsers
+ * Continuous decay scoring. Replaces brittle cleanup heuristics.
+ * Higher = stronger memory; ranking + cleanup both consume this.
  */
+export function effectiveStrength(memory: StoredMemory, now: number = Date.now()): number {
+    if (memory.expiresAt !== undefined && memory.expiresAt < now) return 0
+    if (memory.isValid !== 1) return 0
+
+    const halfLife = HALF_LIFE_DAYS[memory.category] ?? 90
+    const ageDays = (now - memory.createdAt) / DAY_MS
+    const sinceAccessDays = (now - memory.lastAccessedAt) / DAY_MS
+
+    // base decay from age
+    const baseStrength = memory.importance * Math.exp(-ageDays / halfLife)
+    // spaced-repetition style recall boost
+    const recallBoost = Math.log(1 + memory.accessCount) * 2
+    // recently accessed memories resist decay
+    const accessRecency = 3 * Math.exp(-sinceAccessDays / halfLife)
+    // confidence: 0.5x at 1, 1.0x at 10
+    const confidenceFactor = 0.5 + (memory.confidence / 10) * 0.5
+
+    return (baseStrength + recallBoost + accessRecency) * confidenceFactor
+}
+
 function chineseTokenizer(text: string): string[] {
     const tokens: string[] = []
 
-    // Check if Intl.Segmenter is available (modern browsers)
     if (typeof Intl !== 'undefined' && 'Segmenter' in Intl) {
-        // Use Intl.Segmenter for proper Chinese word segmentation
         const segmenter = new Intl.Segmenter('zh-CN', { granularity: 'word' })
         const segments = segmenter.segment(text)
 
         for (const segment of segments) {
             const word = segment.segment.trim().toLowerCase()
-            // Filter out punctuation and very short segments
-            if (word.length >= 1 && /[\u4e00-\u9fa5a-zA-Z0-9]/.test(word)) {
-                // For Chinese, keep single characters too (they can be meaningful)
-                // For English, require at least 2 characters
-                const isChinese = /[\u4e00-\u9fa5]/.test(word)
+            if (word.length >= 1 && /[一-龥a-zA-Z0-9]/.test(word)) {
+                const isChinese = /[一-龥]/.test(word)
                 if (isChinese || word.length >= 2) {
                     tokens.push(word)
                 }
             }
         }
     } else {
-        // Fallback: character-by-character for Chinese, word-by-word for English
         let englishBuffer = ''
-
         for (const char of text) {
-            if (/[\u4e00-\u9fa5]/.test(char)) {
-                // Flush English buffer
-                if (englishBuffer.length >= 2) {
-                    tokens.push(englishBuffer.toLowerCase())
-                }
+            if (/[一-龥]/.test(char)) {
+                if (englishBuffer.length >= 2) tokens.push(englishBuffer.toLowerCase())
                 englishBuffer = ''
-                // Add Chinese character
                 tokens.push(char)
             } else if (/[a-zA-Z0-9]/.test(char)) {
                 englishBuffer += char
             } else {
-                if (englishBuffer.length >= 2) {
-                    tokens.push(englishBuffer.toLowerCase())
-                }
+                if (englishBuffer.length >= 2) tokens.push(englishBuffer.toLowerCase())
                 englishBuffer = ''
             }
         }
-
-        if (englishBuffer.length >= 2) {
-            tokens.push(englishBuffer.toLowerCase())
-        }
+        if (englishBuffer.length >= 2) tokens.push(englishBuffer.toLowerCase())
     }
 
-    // Remove duplicates while preserving order
     return [...new Set(tokens)]
 }
 
-/**
- * Create a Flexsearch index optimized for Chinese + English
- */
 function createSearchIndex(): Index {
     return new Index({
         tokenize: chineseTokenizer,
@@ -134,7 +154,6 @@ class MemoryStore {
 
     private async getDB(): Promise<IDBDatabase> {
         if (this.db) return this.db
-
         if (this.dbPromise) return this.dbPromise
 
         this.dbPromise = new Promise((resolve, reject) => {
@@ -151,36 +170,62 @@ class MemoryStore {
 
             request.onupgradeneeded = event => {
                 const db = (event.target as IDBOpenDBRequest).result
+                const transaction = (event.target as IDBOpenDBRequest).transaction
                 const oldVersion = event.oldVersion
 
-                // Handle fresh install or upgrade from version 1
+                let store: IDBObjectStore
                 if (oldVersion < 1) {
-                    // Fresh install
-                    const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' })
-                    store.createIndex('category', 'category', { unique: false })
-                    store.createIndex('importance', 'importance', { unique: false })
-                    store.createIndex('createdAt', 'createdAt', { unique: false })
-                    store.createIndex('lastAccessedAt', 'lastAccessedAt', { unique: false })
-                    store.createIndex('isValid', 'isValid', { unique: false })
-                } else if (oldVersion === 1) {
-                    // Upgrading from v1 - need to migrate boolean isValid to number
-                    const transaction = (event.target as IDBOpenDBRequest).transaction
-                    if (transaction) {
-                        const store = transaction.objectStore(STORE_NAME)
-                        const cursorRequest = store.openCursor()
+                    store = db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+                } else if (transaction) {
+                    store = transaction.objectStore(STORE_NAME)
+                } else {
+                    return
+                }
 
-                        cursorRequest.onsuccess = (e) => {
-                            const cursor = (e.target as IDBRequest<IDBCursorWithValue>).result
-                            if (cursor) {
-                                const record = cursor.value
-                                // Convert boolean to number
-                                if (typeof record.isValid === 'boolean') {
-                                    record.isValid = record.isValid ? 1 : 0
-                                    cursor.update(record)
-                                }
-                                cursor.continue()
-                            }
+                // Clean up indexes that may exist from older versions
+                for (const name of Array.from(store.indexNames)) {
+                    store.deleteIndex(name)
+                }
+
+                // Compound indexes: filter on isValid first, no JS-side filtering
+                store.createIndex('valid_importance', ['isValid', 'importance'], { unique: false })
+                store.createIndex('valid_createdAt', ['isValid', 'createdAt'], { unique: false })
+                store.createIndex('valid_category', ['isValid', 'category'], { unique: false })
+                store.createIndex('valid_subject', ['isValid', 'subject'], { unique: false })
+                store.createIndex('valid_lastAccessed', ['isValid', 'lastAccessedAt'], { unique: false })
+                store.createIndex('isValid', 'isValid', { unique: false })
+
+                // Migrate existing rows: backfill new fields
+                if (oldVersion > 0 && oldVersion < 3 && transaction) {
+                    const cursorRequest = store.openCursor()
+                    cursorRequest.onsuccess = e => {
+                        const cursor = (e.target as IDBRequest<IDBCursorWithValue>).result
+                        if (!cursor) return
+                        const record = cursor.value as StoredMemory & { keywords?: unknown }
+                        let touched = false
+                        if (typeof record.isValid === 'boolean') {
+                            record.isValid = (record as any).isValid ? 1 : 0
+                            touched = true
                         }
+                        if (record.confidence === undefined) {
+                            record.confidence = record.importance ?? 5
+                            touched = true
+                        }
+                        if (record.subject === undefined) {
+                            record.subject = inferSubjectFromCategory(record.category)
+                            touched = true
+                        }
+                        if (record.source === undefined) {
+                            record.source = 'user_explicit'
+                            touched = true
+                        }
+                        // drop unused keywords
+                        if (record.keywords !== undefined) {
+                            delete record.keywords
+                            touched = true
+                        }
+                        if (touched) cursor.update(record)
+                        cursor.continue()
                     }
                 }
             }
@@ -189,9 +234,6 @@ class MemoryStore {
         return this.dbPromise
     }
 
-    /**
-     * Initialize the Flexsearch index from IndexedDB
-     */
     private async initSearchIndex(): Promise<void> {
         if (this.indexInitialized) return
         if (this.indexInitPromise) return this.indexInitPromise
@@ -205,24 +247,20 @@ class MemoryStore {
                 const transaction = db.transaction([STORE_NAME], 'readonly')
                 const store = transaction.objectStore(STORE_NAME)
                 const index = store.index('isValid')
-                const request = index.openCursor(IDBKeyRange.only(1)) // 1 = valid
+                const request = index.openCursor(IDBKeyRange.only(1))
 
                 request.onsuccess = event => {
                     const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result
-
                     if (cursor) {
                         const memory = cursor.value as StoredMemory
-                        // Add to Flexsearch index
                         this.searchIndex!.add(memory.id, memory.content)
                         this.indexedMemories.set(memory.id, memory)
                         cursor.continue()
                     } else {
                         this.indexInitialized = true
-                        console.log(`[MemoryStore] Search index initialized with ${this.indexedMemories.size} memories`)
                         resolve()
                     }
                 }
-
                 request.onerror = () => reject(new Error(`Failed to init search index: ${request.error?.message}`))
             })
         })()
@@ -230,9 +268,6 @@ class MemoryStore {
         return this.indexInitPromise
     }
 
-    /**
-     * Add a memory to the search index
-     */
     private addToSearchIndex(memory: StoredMemory): void {
         if (this.searchIndex && memory.isValid === 1) {
             this.searchIndex.add(memory.id, memory.content)
@@ -240,9 +275,6 @@ class MemoryStore {
         }
     }
 
-    /**
-     * Remove a memory from the search index
-     */
     private removeFromSearchIndex(id: string): void {
         if (this.searchIndex) {
             this.searchIndex.remove(id)
@@ -250,9 +282,6 @@ class MemoryStore {
         }
     }
 
-    /**
-     * Generate a unique ID for a memory
-     */
     private generateId(): string {
         const timestamp = Date.now().toString(36)
         const random = Math.random().toString(36).slice(2, 8)
@@ -260,25 +289,38 @@ class MemoryStore {
     }
 
     /**
-     * Extract keywords from content for search optimization
+     * Snapshot of all live memories — useful for hybrid retrieval that needs
+     * to score the entire pool against a query embedding.
      */
-    private extractKeywords(content: string): string[] {
-        return chineseTokenizer(content)
+    async getAllValid(): Promise<StoredMemory[]> {
+        await this.initSearchIndex()
+        return Array.from(this.indexedMemories.values())
     }
 
     /**
-     * Store a new memory
+     * Lookup straight from the in-memory cache. Avoids an IDB round trip.
      */
+    getCachedById(id: string): StoredMemory | undefined {
+        return this.indexedMemories.get(id)
+    }
+
     async store(
         content: string,
         category: MemoryCategory,
         importance: number = 5,
-        metadata?: Record<string, unknown>
+        options: {
+            subject?: MemorySubject
+            source?: MemorySource
+            confidence?: number
+            embedding?: number[]
+            expiresAt?: number
+            relatedIds?: string[]
+            metadata?: Record<string, unknown>
+        } = {}
     ): Promise<StoredMemory> {
         const db = await this.getDB()
         await this.initSearchIndex()
 
-        // Generate current date in yyyy-mm-dd format
         const now = new Date()
         const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
 
@@ -286,23 +328,26 @@ class MemoryStore {
             id: this.generateId(),
             content,
             category,
-            importance: Math.max(1, Math.min(10, importance)),
-            keywords: this.extractKeywords(content),
+            subject: options.subject ?? inferSubjectFromCategory(category),
+            source: options.source ?? 'user_explicit',
+            importance: clamp(importance, 1, 10),
+            confidence: clamp(options.confidence ?? importance, 1, 10),
             createdAt: Date.now(),
             lastAccessedAt: Date.now(),
             accessCount: 0,
-            isValid: 1, // 1 = valid
+            isValid: 1,
             date,
-            metadata,
+            embedding: options.embedding,
+            relatedIds: options.relatedIds,
+            expiresAt: options.expiresAt,
+            metadata: options.metadata,
         }
 
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readwrite')
             const store = transaction.objectStore(STORE_NAME)
             const request = store.add(memory)
-
             request.onsuccess = () => {
-                // Add to search index
                 this.addToSearchIndex(memory)
                 resolve(memory)
             }
@@ -311,160 +356,144 @@ class MemoryStore {
     }
 
     /**
-     * Full-text search across memories using Flexsearch
+     * Lexical search via Flexsearch. The embedding-aware variant lives in
+     * memory-search.ts, which composes this with vector cosine.
      */
     async search(query: string, limit: number = 10): Promise<MemorySearchResult[]> {
         await this.initSearchIndex()
+        if (!this.searchIndex || !query.trim()) return []
 
-        if (!this.searchIndex || !query.trim()) {
-            return []
-        }
-
-        // Search using Flexsearch
         const searchResults = this.searchIndex.search(query, { limit: limit * 2 })
-
-        // Map results to memories with relevance scores
         const results: MemorySearchResult[] = []
         const queryLower = query.toLowerCase()
+        const now = Date.now()
 
         for (let i = 0; i < searchResults.length; i++) {
             const memoryId = String(searchResults[i])
             const memory = this.indexedMemories.get(memoryId)
+            if (!memory || memory.isValid !== 1) continue
 
-            if (memory && memory.isValid === 1) {
-                // Calculate relevance score
-                let relevanceScore = 100 - i * 5 // Base score from search rank
+            let lexicalScore = 100 - i * 5
+            if (memory.content.toLowerCase().includes(queryLower)) lexicalScore += 30
 
-                // Boost for exact substring match
-                if (memory.content.toLowerCase().includes(queryLower)) {
-                    relevanceScore += 30
-                }
+            const strength = effectiveStrength(memory, now)
+            const relevanceScore = lexicalScore + strength * 2
 
-                // Importance factor
-                relevanceScore += memory.importance * 3
-
-                // Recency factor (memories accessed recently get a small boost)
-                const daysSinceAccess = (Date.now() - memory.lastAccessedAt) / (1000 * 60 * 60 * 24)
-                if (daysSinceAccess < 7) {
-                    relevanceScore += Math.floor(7 - daysSinceAccess)
-                }
-
-                results.push({ ...memory, relevanceScore })
-            }
+            results.push({ ...memory, relevanceScore, lexicalScore, strength })
         }
 
-        // Sort by relevance and return top results
         results.sort((a, b) => b.relevanceScore - a.relevanceScore)
         return results.slice(0, limit)
     }
 
-    /**
-     * Get memories by category
-     */
     async getByCategory(category: MemoryCategory, limit: number = 20): Promise<StoredMemory[]> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readonly')
             const store = transaction.objectStore(STORE_NAME)
-            const index = store.index('category')
-            const request = index.openCursor(IDBKeyRange.only(category), 'prev')
-
+            const index = store.index('valid_category')
+            const range = IDBKeyRange.only([1, category])
+            const request = index.openCursor(range, 'prev')
             const results: StoredMemory[] = []
-
             request.onsuccess = event => {
                 const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result
-
                 if (cursor && results.length < limit) {
-                    const memory = cursor.value as StoredMemory
-                    if (memory.isValid === 1) {
-                        results.push(memory)
-                    }
+                    results.push(cursor.value as StoredMemory)
                     cursor.continue()
                 } else {
                     resolve(results)
                 }
             }
-
             request.onerror = () => reject(new Error(`Failed to get memories: ${request.error?.message}`))
         })
     }
 
-    /**
-     * Get most important memories
-     */
+    async getBySubject(subject: MemorySubject, limit: number = 20): Promise<StoredMemory[]> {
+        const db = await this.getDB()
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readonly')
+            const store = transaction.objectStore(STORE_NAME)
+            const index = store.index('valid_subject')
+            const range = IDBKeyRange.only([1, subject])
+            const request = index.openCursor(range, 'prev')
+            const results: StoredMemory[] = []
+            request.onsuccess = event => {
+                const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result
+                if (cursor && results.length < limit) {
+                    results.push(cursor.value as StoredMemory)
+                    cursor.continue()
+                } else {
+                    resolve(results)
+                }
+            }
+            request.onerror = () => reject(new Error(`Failed to get memories: ${request.error?.message}`))
+        })
+    }
+
     async getMostImportant(limit: number = 10): Promise<StoredMemory[]> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readonly')
             const store = transaction.objectStore(STORE_NAME)
-            const index = store.index('importance')
-            const request = index.openCursor(null, 'prev') // Descending order
-
+            const index = store.index('valid_importance')
+            const range = IDBKeyRange.bound([1, 1], [1, 10])
+            const request = index.openCursor(range, 'prev')
             const results: StoredMemory[] = []
-
             request.onsuccess = event => {
                 const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result
-
                 if (cursor && results.length < limit) {
-                    const memory = cursor.value as StoredMemory
-                    if (memory.isValid === 1) {
-                        results.push(memory)
-                    }
+                    results.push(cursor.value as StoredMemory)
                     cursor.continue()
                 } else {
                     resolve(results)
                 }
             }
-
             request.onerror = () => reject(new Error(`Failed to get memories: ${request.error?.message}`))
         })
     }
 
     /**
-     * Get recent memories
+     * Top-N by effective strength rather than raw importance. The right
+     * default for "what should the agent always have available."
      */
+    async getStrongest(limit: number = 10): Promise<StoredMemory[]> {
+        const all = await this.getAllValid()
+        const now = Date.now()
+        return all
+            .map(m => ({ m, s: effectiveStrength(m, now) }))
+            .sort((a, b) => b.s - a.s)
+            .slice(0, limit)
+            .map(x => x.m)
+    }
+
     async getRecent(limit: number = 10): Promise<StoredMemory[]> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readonly')
             const store = transaction.objectStore(STORE_NAME)
-            const index = store.index('createdAt')
-            const request = index.openCursor(null, 'prev') // Most recent first
-
+            const index = store.index('valid_createdAt')
+            const range = IDBKeyRange.bound([1, 0], [1, Number.MAX_SAFE_INTEGER])
+            const request = index.openCursor(range, 'prev')
             const results: StoredMemory[] = []
-
             request.onsuccess = event => {
                 const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result
-
                 if (cursor && results.length < limit) {
-                    const memory = cursor.value as StoredMemory
-                    if (memory.isValid === 1) {
-                        results.push(memory)
-                    }
+                    results.push(cursor.value as StoredMemory)
                     cursor.continue()
                 } else {
                     resolve(results)
                 }
             }
-
             request.onerror = () => reject(new Error(`Failed to get memories: ${request.error?.message}`))
         })
     }
 
-    /**
-     * Update memory access timestamp and count
-     */
     async recordAccess(id: string): Promise<void> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readwrite')
             const store = transaction.objectStore(STORE_NAME)
             const getRequest = store.get(id)
-
             getRequest.onsuccess = () => {
                 const memory = getRequest.result as StoredMemory | undefined
                 if (memory) {
@@ -472,35 +501,25 @@ class MemoryStore {
                     memory.accessCount += 1
                     const putRequest = store.put(memory)
                     putRequest.onsuccess = () => {
-                        // Update in-memory cache
-                        if (this.indexedMemories.has(id)) {
-                            this.indexedMemories.set(id, memory)
-                        }
+                        if (this.indexedMemories.has(id)) this.indexedMemories.set(id, memory)
                         resolve()
                     }
                     putRequest.onerror = () => reject(new Error(`Failed to update memory: ${putRequest.error?.message}`))
                 } else {
-                    resolve() // Memory not found, silently ignore
+                    resolve()
                 }
             }
-
             getRequest.onerror = () => reject(new Error(`Failed to get memory: ${getRequest.error?.message}`))
         })
     }
 
-    /**
-     * Delete a memory (hard delete)
-     */
     async delete(id: string): Promise<void> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readwrite')
             const store = transaction.objectStore(STORE_NAME)
             const request = store.delete(id)
-
             request.onsuccess = () => {
-                // Remove from search index
                 this.removeFromSearchIndex(id)
                 resolve()
             }
@@ -508,120 +527,91 @@ class MemoryStore {
         })
     }
 
-    /**
-     * Alias for delete() - kept for backward compatibility
-     */
     async invalidate(id: string): Promise<void> {
         return this.delete(id)
     }
 
     /**
-     * Update memory content or importance
+     * Soft-supersede: keep the original memory but mark it superseded. The
+     * replacement memory id is stored on the old record. Old memory becomes
+     * invalid for retrieval but is retained for audit/history.
      */
-    async update(id: string, updates: Partial<Pick<StoredMemory, 'content' | 'importance' | 'category' | 'isValid'>>): Promise<StoredMemory | null> {
-        const db = await this.getDB()
+    async supersede(oldId: string, newId: string): Promise<void> {
+        await this.update(oldId, { isValid: 0, supersededBy: newId })
+    }
 
+    async update(
+        id: string,
+        updates: Partial<Pick<StoredMemory, 'content' | 'importance' | 'confidence' | 'category' | 'subject' | 'isValid' | 'supersededBy' | 'embedding' | 'expiresAt' | 'relatedIds'>>
+    ): Promise<StoredMemory | null> {
+        const db = await this.getDB()
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readwrite')
             const store = transaction.objectStore(STORE_NAME)
             const getRequest = store.get(id)
-
             getRequest.onsuccess = () => {
                 const memory = getRequest.result as StoredMemory | undefined
-                if (memory) {
-                    const contentChanged = updates.content !== undefined && updates.content !== memory.content
+                if (!memory) return resolve(null)
 
-                    if (updates.content !== undefined) {
-                        memory.content = updates.content
-                        memory.keywords = this.extractKeywords(updates.content)
-                    }
-                    if (updates.importance !== undefined) {
-                        memory.importance = Math.max(1, Math.min(10, updates.importance))
-                    }
-                    if (updates.category !== undefined) {
-                        memory.category = updates.category
-                    }
-                    if (updates.isValid !== undefined) {
-                        memory.isValid = updates.isValid
-                    }
+                const contentChanged = updates.content !== undefined && updates.content !== memory.content
 
-                    const putRequest = store.put(memory)
-                    putRequest.onsuccess = () => {
-                        // Update search index if content changed
-                        if (contentChanged && this.searchIndex) {
-                            this.searchIndex.remove(id)
-                            if (memory.isValid === 1) {
-                                this.searchIndex.add(id, memory.content)
-                            }
-                        }
-                        // Update in-memory cache
-                        if (memory.isValid === 1) {
-                            this.indexedMemories.set(id, memory)
-                        } else {
-                            this.indexedMemories.delete(id)
-                        }
-                        resolve(memory)
+                if (updates.content !== undefined) memory.content = updates.content
+                if (updates.importance !== undefined) memory.importance = clamp(updates.importance, 1, 10)
+                if (updates.confidence !== undefined) memory.confidence = clamp(updates.confidence, 1, 10)
+                if (updates.category !== undefined) memory.category = updates.category
+                if (updates.subject !== undefined) memory.subject = updates.subject
+                if (updates.isValid !== undefined) memory.isValid = updates.isValid
+                if (updates.supersededBy !== undefined) memory.supersededBy = updates.supersededBy
+                if (updates.embedding !== undefined) memory.embedding = updates.embedding
+                if (updates.expiresAt !== undefined) memory.expiresAt = updates.expiresAt
+                if (updates.relatedIds !== undefined) memory.relatedIds = updates.relatedIds
+
+                const putRequest = store.put(memory)
+                putRequest.onsuccess = () => {
+                    if (contentChanged && this.searchIndex) {
+                        this.searchIndex.remove(id)
+                        if (memory.isValid === 1) this.searchIndex.add(id, memory.content)
                     }
-                    putRequest.onerror = () => reject(new Error(`Failed to update memory: ${putRequest.error?.message}`))
-                } else {
-                    resolve(null)
+                    if (memory.isValid === 1) this.indexedMemories.set(id, memory)
+                    else this.indexedMemories.delete(id)
+                    resolve(memory)
                 }
+                putRequest.onerror = () => reject(new Error(`Failed to update memory: ${putRequest.error?.message}`))
             }
-
             getRequest.onerror = () => reject(new Error(`Failed to get memory: ${getRequest.error?.message}`))
         })
     }
 
-    /**
-     * Get all valid memories count
-     */
     async getCount(): Promise<number> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readonly')
             const store = transaction.objectStore(STORE_NAME)
             const index = store.index('isValid')
-            const request = index.count(IDBKeyRange.only(1)) // 1 = valid
-
+            const request = index.count(IDBKeyRange.only(1))
             request.onsuccess = () => resolve(request.result)
             request.onerror = () => reject(new Error(`Failed to count memories: ${request.error?.message}`))
         })
     }
 
-    /**
-     * Get a memory by ID
-     */
     async getById(id: string): Promise<StoredMemory | null> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readonly')
             const store = transaction.objectStore(STORE_NAME)
             const request = store.get(id)
-
-            request.onsuccess = () => {
-                const memory = request.result as StoredMemory | undefined
-                resolve(memory ?? null)
-            }
-
+            request.onsuccess = () => resolve((request.result as StoredMemory | undefined) ?? null)
             request.onerror = () => reject(new Error(`Failed to get memory: ${request.error?.message}`))
         })
     }
 
-    /**
-     * Clear all memories (use with caution)
-     */
     async clearAll(): Promise<void> {
         const db = await this.getDB()
-
         return new Promise((resolve, reject) => {
             const transaction = db.transaction([STORE_NAME], 'readwrite')
             const store = transaction.objectStore(STORE_NAME)
             const request = store.clear()
-
             request.onsuccess = () => {
-                // Clear search index
                 this.searchIndex = createSearchIndex()
                 this.indexedMemories.clear()
                 resolve()
@@ -630,10 +620,6 @@ class MemoryStore {
         })
     }
 
-    /**
-     * Rebuild the search index from IndexedDB
-     * Call this if the index seems out of sync
-     */
     async rebuildSearchIndex(): Promise<void> {
         this.indexInitialized = false
         this.indexInitPromise = null
@@ -643,8 +629,59 @@ class MemoryStore {
     }
 
     /**
-     * Close the database connection
+     * Continuous-decay cleanup. Anything below `threshold` strength is
+     * permanently dropped. Returns ids that were removed.
      */
+    async pruneDecayed(threshold: number = 0.5, dryRun: boolean = false): Promise<{ id: string; content: string; strength: number }[]> {
+        const all = await this.getAllValid()
+        const now = Date.now()
+        const decayed: { id: string; content: string; strength: number }[] = []
+        for (const m of all) {
+            const s = effectiveStrength(m, now)
+            if (s < threshold) decayed.push({ id: m.id, content: m.content, strength: s })
+        }
+        if (!dryRun) {
+            for (const d of decayed) await this.delete(d.id)
+        }
+        return decayed
+    }
+
+    /**
+     * Bulk export for backup or transfer.
+     */
+    async exportAll(): Promise<StoredMemory[]> {
+        const db = await this.getDB()
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readonly')
+            const store = transaction.objectStore(STORE_NAME)
+            const request = store.getAll()
+            request.onsuccess = () => resolve((request.result as StoredMemory[]) ?? [])
+            request.onerror = () => reject(new Error(`Failed to export: ${request.error?.message}`))
+        })
+    }
+
+    /**
+     * Bulk import. Merges by id; existing rows are overwritten.
+     */
+    async importMany(memories: StoredMemory[]): Promise<number> {
+        const db = await this.getDB()
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readwrite')
+            const store = transaction.objectStore(STORE_NAME)
+            let count = 0
+            for (const m of memories) {
+                const req = store.put(m)
+                req.onsuccess = () => {
+                    count += 1
+                }
+            }
+            transaction.oncomplete = () => {
+                this.rebuildSearchIndex().finally(() => resolve(count))
+            }
+            transaction.onerror = () => reject(new Error(`Import failed: ${transaction.error?.message}`))
+        })
+    }
+
     close(): void {
         if (this.db) {
             this.db.close()
@@ -658,5 +695,15 @@ class MemoryStore {
     }
 }
 
-// Export a singleton instance
+function clamp(n: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, n))
+}
+
+function inferSubjectFromCategory(category: MemoryCategory): MemorySubject {
+    if (category === 'fact' || category === 'preference') return 'user'
+    if (category === 'event') return 'relationship'
+    return 'other'
+}
+
+export { chineseTokenizer }
 export const memoryStore = new MemoryStore()

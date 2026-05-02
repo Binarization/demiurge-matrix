@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
 import IconCog from '~icons/mdi/cog'
 import IconBrain from '~icons/mdi/brain'
 import { Agent } from '@/lib/agent'
 import { loadStoredOpenRouterConfig, saveStoredOpenRouterConfig } from '@/lib/openrouter-config'
-import { memoryStore } from '@/lib/memory-store'
+import { memoryStore, effectiveStrength, type StoredMemory, type MemoryCategory } from '@/lib/memory-store'
 import { getGreetingMemories, formatMemoriesForPrompt } from '@/lib/memory-tools'
 import { OpenRouterClient } from '@/lib/openrouter'
+import { loadEmbeddingsConfig, saveEmbeddingsConfig, DEFAULT_EMBEDDINGS_CONFIG, type StoredEmbeddingsConfig } from '@/lib/embeddings-config'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
 
@@ -58,6 +59,7 @@ const settingsForm = reactive({
     apiKey: getDefaultConfig().apiKey,
     model: getDefaultConfig().model,
 })
+const embeddingsForm = reactive<StoredEmbeddingsConfig>({ ...DEFAULT_EMBEDDINGS_CONFIG })
 const messages = ref<ChatMessage[]>([])
 const defaultGreeting = '你来啦，伙伴～'
 const isLoadingGreeting = ref(true)
@@ -258,38 +260,164 @@ const updateMemoryCount = async () => {
     }
 }
 
-const recentMemories = ref<Array<{ id: string; content: string; category: string; importance: number }>>([])
+type MemoryView = StoredMemory & { strength: number }
 
-const loadRecentMemories = async () => {
+const allMemories = ref<MemoryView[]>([])
+const memorySearchQuery = ref('')
+const memorySort = ref<'strongest' | 'recent' | 'important'>('strongest')
+const memoryGroupBy = ref<'category' | 'none'>('category')
+const editingMemoryId = ref<string | null>(null)
+const editingMemoryContent = ref('')
+const editingMemoryImportance = ref(5)
+const editingMemoryConfidence = ref(5)
+const fileInputRef = ref<HTMLInputElement | null>(null)
+
+const loadAllMemories = async () => {
     try {
-        const memories = await memoryStore.getRecent(10)
-        recentMemories.value = memories.map(m => ({
-            id: m.id,
-            content: m.content,
-            category: m.category,
-            importance: m.importance,
-        }))
+        const memories = await memoryStore.exportAll()
+        const valid = memories.filter(m => m.isValid === 1)
+        allMemories.value = valid.map(m => ({ ...m, strength: effectiveStrength(m) }))
     } catch (error) {
-        console.warn('Failed to load recent memories:', error)
+        console.warn('Failed to load memories:', error)
     }
 }
 
+const filteredMemories = computed(() => {
+    const q = memorySearchQuery.value.trim().toLowerCase()
+    let list = allMemories.value
+    if (q) {
+        list = list.filter(m => m.content.toLowerCase().includes(q))
+    }
+    const sorted = [...list]
+    if (memorySort.value === 'recent') {
+        sorted.sort((a, b) => b.createdAt - a.createdAt)
+    } else if (memorySort.value === 'important') {
+        sorted.sort((a, b) => b.importance - a.importance)
+    } else {
+        sorted.sort((a, b) => b.strength - a.strength)
+    }
+    return sorted
+})
+
+const groupedMemories = computed(() => {
+    if (memoryGroupBy.value === 'none') return null
+    const groups: Record<MemoryCategory, MemoryView[]> = {
+        fact: [], preference: [], event: [], correction: [], context: [],
+    }
+    for (const m of filteredMemories.value) {
+        groups[m.category].push(m)
+    }
+    return groups
+})
+
+const categoryLabel = (cat: MemoryCategory) => ({
+    fact: '事实', preference: '偏好', event: '事件', correction: '纠正', context: '背景',
+}[cat])
+
+const subjectLabel = (subj: string) => ({
+    user: '伙伴', character: '昔涟', world: '世界', relationship: '关系', other: '其他',
+} as Record<string, string>)[subj] ?? subj
+
+const formatRelativeTime = (ts: number): string => {
+    const diff = Date.now() - ts
+    const mins = Math.floor(diff / 60000)
+    if (mins < 1) return '刚刚'
+    if (mins < 60) return `${mins} 分钟前`
+    const hours = Math.floor(mins / 60)
+    if (hours < 24) return `${hours} 小时前`
+    const days = Math.floor(hours / 24)
+    if (days < 30) return `${days} 天前`
+    const months = Math.floor(days / 30)
+    return `${months} 个月前`
+}
+
 const openMemoryPanel = async () => {
-    await loadRecentMemories()
+    await loadAllMemories()
     isMemoryPanelOpen.value = true
 }
 
 const closeMemoryPanel = () => {
     isMemoryPanelOpen.value = false
+    editingMemoryId.value = null
 }
 
 const deleteMemory = async (id: string) => {
     try {
         await memoryStore.invalidate(id)
-        await loadRecentMemories()
+        await loadAllMemories()
         await updateMemoryCount()
     } catch (error) {
         console.warn('Failed to delete memory:', error)
+    }
+}
+
+const startEditMemory = (m: MemoryView) => {
+    editingMemoryId.value = m.id
+    editingMemoryContent.value = m.content
+    editingMemoryImportance.value = m.importance
+    editingMemoryConfidence.value = m.confidence
+}
+
+const cancelEditMemory = () => {
+    editingMemoryId.value = null
+}
+
+const saveEditMemory = async () => {
+    if (!editingMemoryId.value) return
+    try {
+        await memoryStore.update(editingMemoryId.value, {
+            content: editingMemoryContent.value.trim(),
+            importance: editingMemoryImportance.value,
+            confidence: editingMemoryConfidence.value,
+        })
+        editingMemoryId.value = null
+        await loadAllMemories()
+        await updateMemoryCount()
+    } catch (error) {
+        console.warn('Failed to update memory:', error)
+    }
+}
+
+const exportMemories = async () => {
+    try {
+        const memories = await memoryStore.exportAll()
+        const blob = new Blob([JSON.stringify(memories, null, 2)], { type: 'application/json' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        const date = new Date().toISOString().slice(0, 10)
+        a.download = `cyrene-memories-${date}.json`
+        a.click()
+        URL.revokeObjectURL(url)
+    } catch (error) {
+        console.warn('Export failed:', error)
+    }
+}
+
+const triggerImport = () => {
+    fileInputRef.value?.click()
+}
+
+const handleImportFile = async (e: Event) => {
+    const input = e.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+    try {
+        const text = await file.text()
+        const parsed = JSON.parse(text)
+        if (!Array.isArray(parsed)) {
+            alert('导入失败：文件格式不正确')
+            return
+        }
+        const count = await memoryStore.importMany(parsed)
+        await loadAllMemories()
+        await updateMemoryCount()
+        alert(`已导入 ${count} 条记忆`)
+    } catch (error) {
+        console.warn('Import failed:', error)
+        alert('导入失败：' + (error instanceof Error ? error.message : '未知错误'))
+    } finally {
+        input.value = ''
     }
 }
 
@@ -297,12 +425,18 @@ const clearAllMemories = async () => {
     if (confirm('确定要清除所有记忆吗？此操作不可恢复。')) {
         try {
             await memoryStore.clearAll()
-            await loadRecentMemories()
+            await loadAllMemories()
             await updateMemoryCount()
         } catch (error) {
             console.warn('Failed to clear memories:', error)
         }
     }
+}
+
+const handleEmbeddingsSave = () => {
+    saveEmbeddingsConfig({ ...embeddingsForm })
+    settingsSaved.value = true
+    setTimeout(() => { settingsSaved.value = false }, 2000)
 }
 
 const updateSuggestions = async () => {
@@ -393,6 +527,8 @@ onMounted(async () => {
         settingsForm.model = defaultConfig.model
         saveStoredOpenRouterConfig(defaultConfig)
     }
+
+    Object.assign(embeddingsForm, loadEmbeddingsConfig())
 
     // Generate personalized greeting based on memories
     isLoadingGreeting.value = true
@@ -564,41 +700,108 @@ defineExpose({
                         </button>
                     </header>
 
-                    <form class="space-y-6" @submit.prevent="handleSettingsSubmit">
-                        <div class="space-y-2">
-                            <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">API 密钥</label>
-                            <input
-                                v-model="settingsForm.apiKey"
-                                type="password"
-                                required
-                                class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3.5 text-[15px] text-white transition focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
-                                placeholder="sk-..."
-                            />
-                        </div>
+                    <div class="max-h-[70vh] overflow-y-auto pr-1 space-y-6">
+                        <form class="space-y-4" @submit.prevent="handleSettingsSubmit">
+                            <div class="space-y-2">
+                                <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">API 密钥</label>
+                                <input
+                                    v-model="settingsForm.apiKey"
+                                    type="password"
+                                    required
+                                    class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3.5 text-[15px] text-white transition focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                                    placeholder="sk-..."
+                                />
+                            </div>
 
-                        <div class="space-y-2">
-                            <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">模型</label>
-                            <input
-                                v-model="settingsForm.model"
-                                type="text"
-                                class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3.5 text-[15px] text-white transition focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
-                                placeholder="如：google/gemini-2.5-flash"
-                            />
-                        </div>
+                            <div class="space-y-2">
+                                <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">模型</label>
+                                <input
+                                    v-model="settingsForm.model"
+                                    type="text"
+                                    class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3.5 text-[15px] text-white transition focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                                    placeholder="如：google/gemini-2.5-flash"
+                                />
+                            </div>
 
-                        <div class="flex items-center justify-between pt-4">
-                            <span v-if="settingsSaved" class="text-sm text-green-400 font-medium">已保存</span>
-                            <span v-else></span>
-                            
-                            <button
-                                type="submit"
-                                class="rounded-full bg-white px-8 py-3 text-sm font-semibold text-black shadow-lg transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
-                                :disabled="!settingsForm.apiKey.trim()"
-                            >
-                                保存
-                            </button>
+                            <div class="flex items-center justify-between pt-2">
+                                <span v-if="settingsSaved" class="text-sm text-green-400 font-medium">已保存</span>
+                                <span v-else></span>
+                                <button
+                                    type="submit"
+                                    class="rounded-full bg-white px-8 py-3 text-sm font-semibold text-black shadow-lg transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
+                                    :disabled="!settingsForm.apiKey.trim()"
+                                >
+                                    保存
+                                </button>
+                            </div>
+                        </form>
+
+                        <div class="border-t border-white/5 pt-6 space-y-4">
+                            <div class="flex items-center justify-between">
+                                <h3 class="text-sm font-semibold text-white/80">语义检索（可选）</h3>
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input
+                                        v-model="embeddingsForm.enabled"
+                                        type="checkbox"
+                                        class="h-4 w-4 rounded accent-pink-400"
+                                    />
+                                    <span class="text-xs text-white/60">启用</span>
+                                </label>
+                            </div>
+                            <p class="text-xs text-white/40 -mt-2">配置 OpenAI 兼容的 embeddings 端点以启用向量搜索。未启用时使用关键词检索。</p>
+
+                            <div class="space-y-2">
+                                <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">Base URL</label>
+                                <input
+                                    v-model="embeddingsForm.baseUrl"
+                                    type="text"
+                                    class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3 text-[14px] text-white focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                                    placeholder="https://api.openai.com/v1"
+                                />
+                            </div>
+
+                            <div class="space-y-2">
+                                <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">API Key</label>
+                                <input
+                                    v-model="embeddingsForm.apiKey"
+                                    type="password"
+                                    class="w-full rounded-2xl border border-white/5 bg-black/20 px-4 py-3 text-[14px] text-white focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                                    placeholder="sk-..."
+                                />
+                            </div>
+
+                            <div class="grid grid-cols-2 gap-3">
+                                <div class="space-y-2">
+                                    <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">模型</label>
+                                    <input
+                                        v-model="embeddingsForm.model"
+                                        type="text"
+                                        class="w-full rounded-2xl border border-white/5 bg-black/20 px-3 py-3 text-[14px] text-white focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                                        placeholder="text-embedding-3-small"
+                                    />
+                                </div>
+                                <div class="space-y-2">
+                                    <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">维度</label>
+                                    <input
+                                        v-model.number="embeddingsForm.dimensions"
+                                        type="number"
+                                        class="w-full rounded-2xl border border-white/5 bg-black/20 px-3 py-3 text-[14px] text-white focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                                        placeholder="512"
+                                    />
+                                </div>
+                            </div>
+
+                            <div class="flex justify-end">
+                                <button
+                                    type="button"
+                                    @click="handleEmbeddingsSave"
+                                    class="rounded-full bg-white/10 hover:bg-white/20 px-6 py-2 text-sm font-medium text-white transition"
+                                >
+                                    保存语义配置
+                                </button>
+                            </div>
                         </div>
-                    </form>
+                    </div>
                 </div>
             </div>
         </Transition>
@@ -606,62 +809,204 @@ defineExpose({
         <!-- 记忆管理弹窗 -->
         <Transition name="fade-scale">
             <div v-if="isMemoryPanelOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-                <div class="relative w-[520px] max-w-[90vw] max-h-[80vh] overflow-hidden rounded-[32px] border border-white/10 bg-[#1c1c1e]/90 shadow-2xl backdrop-blur-xl flex flex-col">
-                    <header class="p-8 pb-4 flex items-center justify-between shrink-0">
+                <div class="relative w-[640px] max-w-[92vw] max-h-[85vh] overflow-hidden rounded-[32px] border border-white/10 bg-[#1c1c1e]/90 shadow-2xl backdrop-blur-xl flex flex-col">
+                    <header class="px-8 pt-7 pb-4 flex items-center justify-between shrink-0">
                         <div>
                             <h2 class="text-xl font-semibold text-white">长期记忆</h2>
-                            <p class="text-sm text-white/50 mt-1">共 {{ memoryCount }} 条记忆</p>
+                            <p class="text-sm text-white/50 mt-1">共 {{ memoryCount }} 条记忆 · 显示 {{ filteredMemories.length }} 条</p>
                         </div>
                         <button @click="closeMemoryPanel" class="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-white/60 transition hover:bg-white/20 hover:text-white">
                             <span class="text-lg leading-none">×</span>
                         </button>
                     </header>
 
+                    <!-- 搜索/排序工具栏 -->
+                    <div class="px-8 pb-3 flex items-center gap-2 shrink-0">
+                        <input
+                            v-model="memorySearchQuery"
+                            type="text"
+                            placeholder="搜索记忆..."
+                            class="flex-1 rounded-2xl border border-white/5 bg-black/20 px-4 py-2.5 text-[14px] text-white placeholder:text-white/30 focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
+                        />
+                        <select
+                            v-model="memorySort"
+                            class="rounded-2xl border border-white/5 bg-black/20 px-3 py-2.5 text-[13px] text-white focus:outline-none"
+                        >
+                            <option value="strongest">按强度</option>
+                            <option value="recent">按时间</option>
+                            <option value="important">按重要性</option>
+                        </select>
+                        <button
+                            @click="memoryGroupBy = memoryGroupBy === 'category' ? 'none' : 'category'"
+                            class="rounded-2xl border border-white/5 bg-black/20 px-3 py-2.5 text-[13px] text-white/70 hover:bg-white/10 transition"
+                            :title="memoryGroupBy === 'category' ? '取消分组' : '按类别分组'"
+                        >
+                            {{ memoryGroupBy === 'category' ? '已分组' : '未分组' }}
+                        </button>
+                    </div>
+
                     <div class="flex-1 overflow-y-auto px-8 pb-4">
-                        <div v-if="recentMemories.length === 0" class="py-12 text-center text-white/40">
+                        <div v-if="filteredMemories.length === 0" class="py-12 text-center text-white/40">
                             <IconBrain class="mx-auto h-12 w-12 mb-4 opacity-50" />
-                            <p>暂无记忆</p>
-                            <p class="text-sm mt-2">与昔涟对话时，重要信息会被自动记住</p>
+                            <p v-if="allMemories.length === 0">暂无记忆</p>
+                            <p v-else>没有匹配的记忆</p>
+                            <p class="text-sm mt-2" v-if="allMemories.length === 0">与昔涟对话时，重要信息会被自动记住</p>
                         </div>
-                        <div v-else class="space-y-3">
+
+                        <!-- 分组视图 -->
+                        <template v-else-if="groupedMemories">
+                            <div v-for="cat in (['fact','preference','event','correction','context'] as const)" :key="cat">
+                                <div v-if="groupedMemories[cat].length > 0" class="mb-4">
+                                    <h3 class="text-xs font-semibold text-white/40 uppercase tracking-wider mb-2 px-1">
+                                        {{ categoryLabel(cat) }} ({{ groupedMemories[cat].length }})
+                                    </h3>
+                                    <div class="space-y-2">
+                                        <div
+                                            v-for="memory in groupedMemories[cat]"
+                                            :key="memory.id"
+                                            class="group relative rounded-2xl border border-white/5 bg-white/5 p-4 transition hover:bg-white/10"
+                                        >
+                                            <!-- 编辑模式 -->
+                                            <div v-if="editingMemoryId === memory.id" class="space-y-3">
+                                                <textarea
+                                                    v-model="editingMemoryContent"
+                                                    rows="3"
+                                                    class="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white focus:outline-none focus:ring-1 focus:ring-white/20 resize-none"
+                                                />
+                                                <div class="flex items-center gap-4 text-xs text-white/60">
+                                                    <label class="flex items-center gap-2 flex-1">
+                                                        <span class="shrink-0">重要性</span>
+                                                        <input v-model.number="editingMemoryImportance" type="range" min="1" max="10" class="flex-1 accent-pink-400" />
+                                                        <span class="w-6 text-center">{{ editingMemoryImportance }}</span>
+                                                    </label>
+                                                    <label class="flex items-center gap-2 flex-1">
+                                                        <span class="shrink-0">可信度</span>
+                                                        <input v-model.number="editingMemoryConfidence" type="range" min="1" max="10" class="flex-1 accent-blue-400" />
+                                                        <span class="w-6 text-center">{{ editingMemoryConfidence }}</span>
+                                                    </label>
+                                                </div>
+                                                <div class="flex justify-end gap-2">
+                                                    <button @click="cancelEditMemory" class="px-3 py-1.5 text-xs text-white/60 hover:text-white">取消</button>
+                                                    <button @click="saveEditMemory" class="px-4 py-1.5 text-xs font-medium bg-white/15 hover:bg-white/25 text-white rounded-full">保存</button>
+                                                </div>
+                                            </div>
+
+                                            <!-- 浏览模式 -->
+                                            <div v-else class="flex items-start gap-3">
+                                                <span class="shrink-0 rounded-lg bg-pink-500/15 px-2 py-1 text-[10px] font-medium text-pink-300">
+                                                    {{ subjectLabel(memory.subject) }}
+                                                </span>
+                                                <div class="flex-1 min-w-0">
+                                                    <p class="text-sm text-white/90 leading-relaxed">{{ memory.content }}</p>
+                                                    <div class="mt-2 flex items-center gap-3 text-[10px] text-white/30 flex-wrap">
+                                                        <span>重要 {{ memory.importance }}</span>
+                                                        <span>可信 {{ memory.confidence }}</span>
+                                                        <span>强度 {{ memory.strength.toFixed(1) }}</span>
+                                                        <span v-if="memory.accessCount > 0">访问 {{ memory.accessCount }}×</span>
+                                                        <span>{{ formatRelativeTime(memory.lastAccessedAt) }}</span>
+                                                        <span v-if="memory.expiresAt" class="text-amber-400/60">⏱ {{ formatRelativeTime(memory.expiresAt) }}</span>
+                                                    </div>
+                                                </div>
+                                                <div class="shrink-0 flex gap-1 opacity-0 group-hover:opacity-100 transition">
+                                                    <button
+                                                        @click="startEditMemory(memory)"
+                                                        class="flex h-6 w-6 items-center justify-center rounded-full bg-white/10 text-white/60 hover:bg-white/20 hover:text-white text-xs"
+                                                        title="编辑"
+                                                    >
+                                                        ✎
+                                                    </button>
+                                                    <button
+                                                        @click="deleteMemory(memory.id)"
+                                                        class="flex h-6 w-6 items-center justify-center rounded-full bg-red-500/20 text-red-300 hover:bg-red-500/40 text-xs"
+                                                        title="删除"
+                                                    >
+                                                        ×
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
+
+                        <!-- 平铺视图 -->
+                        <div v-else class="space-y-2">
                             <div
-                                v-for="memory in recentMemories"
+                                v-for="memory in filteredMemories"
                                 :key="memory.id"
                                 class="group relative rounded-2xl border border-white/5 bg-white/5 p-4 transition hover:bg-white/10"
                             >
-                                <div class="flex items-start gap-3">
-                                    <span class="shrink-0 rounded-lg bg-pink-500/20 px-2 py-1 text-[10px] font-medium text-pink-300 uppercase">
-                                        {{ memory.category }}
+                                <div v-if="editingMemoryId === memory.id" class="space-y-3">
+                                    <textarea
+                                        v-model="editingMemoryContent"
+                                        rows="3"
+                                        class="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white focus:outline-none focus:ring-1 focus:ring-white/20 resize-none"
+                                    />
+                                    <div class="flex items-center gap-4 text-xs text-white/60">
+                                        <label class="flex items-center gap-2 flex-1">
+                                            <span class="shrink-0">重要性</span>
+                                            <input v-model.number="editingMemoryImportance" type="range" min="1" max="10" class="flex-1 accent-pink-400" />
+                                            <span class="w-6 text-center">{{ editingMemoryImportance }}</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 flex-1">
+                                            <span class="shrink-0">可信度</span>
+                                            <input v-model.number="editingMemoryConfidence" type="range" min="1" max="10" class="flex-1 accent-blue-400" />
+                                            <span class="w-6 text-center">{{ editingMemoryConfidence }}</span>
+                                        </label>
+                                    </div>
+                                    <div class="flex justify-end gap-2">
+                                        <button @click="cancelEditMemory" class="px-3 py-1.5 text-xs text-white/60 hover:text-white">取消</button>
+                                        <button @click="saveEditMemory" class="px-4 py-1.5 text-xs font-medium bg-white/15 hover:bg-white/25 text-white rounded-full">保存</button>
+                                    </div>
+                                </div>
+                                <div v-else class="flex items-start gap-3">
+                                    <span class="shrink-0 rounded-lg bg-pink-500/15 px-2 py-1 text-[10px] font-medium text-pink-300">
+                                        {{ categoryLabel(memory.category) }}·{{ subjectLabel(memory.subject) }}
                                     </span>
                                     <div class="flex-1 min-w-0">
                                         <p class="text-sm text-white/90 leading-relaxed">{{ memory.content }}</p>
-                                        <div class="mt-2 flex items-center gap-2">
-                                            <span class="text-[10px] text-white/30">重要性: {{ memory.importance }}/10</span>
+                                        <div class="mt-2 flex items-center gap-3 text-[10px] text-white/30 flex-wrap">
+                                            <span>重要 {{ memory.importance }}</span>
+                                            <span>可信 {{ memory.confidence }}</span>
+                                            <span>强度 {{ memory.strength.toFixed(1) }}</span>
+                                            <span v-if="memory.accessCount > 0">访问 {{ memory.accessCount }}×</span>
+                                            <span>{{ formatRelativeTime(memory.lastAccessedAt) }}</span>
                                         </div>
                                     </div>
-                                    <button
-                                        @click="deleteMemory(memory.id)"
-                                        class="shrink-0 opacity-0 group-hover:opacity-100 flex h-6 w-6 items-center justify-center rounded-full bg-red-500/20 text-red-300 transition hover:bg-red-500/40"
-                                        title="删除记忆"
-                                    >
-                                        <span class="text-xs">×</span>
-                                    </button>
+                                    <div class="shrink-0 flex gap-1 opacity-0 group-hover:opacity-100 transition">
+                                        <button @click="startEditMemory(memory)" class="flex h-6 w-6 items-center justify-center rounded-full bg-white/10 text-white/60 hover:bg-white/20 hover:text-white text-xs" title="编辑">✎</button>
+                                        <button @click="deleteMemory(memory.id)" class="flex h-6 w-6 items-center justify-center rounded-full bg-red-500/20 text-red-300 hover:bg-red-500/40 text-xs" title="删除">×</button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                     </div>
 
-                    <footer class="p-8 pt-4 border-t border-white/5 shrink-0">
-                        <div class="flex items-center justify-between">
-                            <p class="text-xs text-white/30">记忆会在对话中自动检索并注入</p>
+                    <footer class="px-8 py-4 border-t border-white/5 shrink-0 flex items-center justify-between gap-2">
+                        <div class="flex gap-2">
                             <button
-                                v-if="memoryCount > 0"
-                                @click="clearAllMemories"
-                                class="rounded-full border border-red-500/30 bg-red-500/10 px-4 py-2 text-xs font-medium text-red-300 transition hover:bg-red-500/20"
+                                @click="exportMemories"
+                                class="rounded-full bg-white/10 hover:bg-white/20 px-4 py-2 text-xs font-medium text-white transition"
+                                :disabled="memoryCount === 0"
                             >
-                                清除所有
+                                导出
                             </button>
+                            <button
+                                @click="triggerImport"
+                                class="rounded-full bg-white/10 hover:bg-white/20 px-4 py-2 text-xs font-medium text-white transition"
+                            >
+                                导入
+                            </button>
+                            <input ref="fileInputRef" type="file" accept="application/json" class="hidden" @change="handleImportFile" />
                         </div>
+                        <button
+                            v-if="memoryCount > 0"
+                            @click="clearAllMemories"
+                            class="rounded-full border border-red-500/30 bg-red-500/10 px-4 py-2 text-xs font-medium text-red-300 transition hover:bg-red-500/20"
+                        >
+                            清除所有
+                        </button>
                     </footer>
                 </div>
             </div>

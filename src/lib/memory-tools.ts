@@ -1,20 +1,34 @@
 /**
  * Memory Tools for Agent
  *
- * These tools allow the agent to:
- * - Store important information for long-term recall
- * - Search and recall relevant memories
- * - Forget/invalidate incorrect or outdated memories
- * - Update existing memories with corrections
+ * v3 changes:
+ *   - recall_memory uses hybrid (lexical + vector + decay) search
+ *   - store_memory does semantic dup detection + soft-supersedes contradictions
+ *   - new fields: subject, confidence, expires_in_days, source
+ *   - cleanup driven by continuous decay (effectiveStrength) instead of brittle rules
  */
 
 import type { Tool, ToolResult } from './agent'
-import { memoryStore, type MemoryCategory, type StoredMemory } from './memory-store'
+import {
+    memoryStore,
+    effectiveStrength,
+    type MemoryCategory,
+    type MemorySubject,
+    type StoredMemory,
+} from './memory-store'
+import { embed, isEmbeddingsAvailable } from './embeddings'
+import { hybridSearch, findSimilarByEmbedding } from './memory-search'
+
+const VALID_CATEGORIES: MemoryCategory[] = ['fact', 'preference', 'event', 'correction', 'context']
+const VALID_SUBJECTS: MemorySubject[] = ['user', 'character', 'world', 'relationship', 'other']
 
 type StoreMemoryArgs = {
     content: string
     category: MemoryCategory
     importance?: number
+    confidence?: number
+    subject?: MemorySubject
+    expires_in_days?: number
     reason?: string
 }
 
@@ -22,6 +36,7 @@ type RecallMemoryArgs = {
     query: string
     limit?: number
     category?: MemoryCategory
+    subject?: MemorySubject
 }
 
 type ForgetMemoryArgs = {
@@ -33,34 +48,66 @@ type UpdateMemoryArgs = {
     memoryId: string
     content?: string
     importance?: number
+    confidence?: number
     reason?: string
 }
 
 type ListMemoriesArgs = {
     category?: MemoryCategory
-    sortBy?: 'recent' | 'important'
+    subject?: MemorySubject
+    sortBy?: 'recent' | 'important' | 'strongest'
     limit?: number
 }
 
 /**
- * Tool for storing new memories
+ * Detect whether `newContent` likely contradicts `existing`. Heuristic only —
+ * caught by overlapping keywords plus a polarity flip ("不/没" diff). Cheap,
+ * good-enough for the common case "我喜欢X" → "我不喜欢X".
  */
+function looksContradictory(newContent: string, existing: string): boolean {
+    const negationTokens = ['不', '没', '别', '不再', '已经不', '已不', '不是', "don't", 'not', 'no longer']
+    const newHasNeg = negationTokens.some(t => newContent.includes(t))
+    const oldHasNeg = negationTokens.some(t => existing.includes(t))
+    if (newHasNeg === oldHasNeg) return false
+    // Both should share substantial content otherwise this isn't a contradiction
+    const stripped = (s: string) => s.replace(/[^一-龥a-zA-Z0-9]/g, '').toLowerCase()
+    const a = stripped(newContent)
+    const b = stripped(existing)
+    if (a.length < 4 || b.length < 4) return false
+    // overlap ratio
+    let shared = 0
+    for (let i = 0; i < a.length - 1; i++) {
+        if (b.includes(a.slice(i, i + 2))) shared += 1
+    }
+    return shared / (a.length - 1) > 0.45
+}
+
 export const storeMemoryTool: Tool = {
     name: 'store_memory',
-    description: `Store important information to long-term memory for future recall. Use this when:
-- Learning a new fact about the user (name, preferences, experiences)
-- Recording a significant event or decision
-- Noting something the user explicitly wants you to remember
-- Correcting a previous misunderstanding
+    description: `存储重要信息到长期记忆。
 
-Parameters:
-- content: The information to remember (be specific and clear)
-- category: One of 'fact', 'preference', 'event', 'correction', 'context'
-- importance: 1-10 scale (10 = critical to remember, 1 = minor detail)
-- reason: Why this is worth remembering`,
+何时使用：
+- 学到关于伙伴的新事实（姓名、偏好、经历）
+- 重要事件或决定
+- 伙伴明确要求记住的事
+- 纠正之前的误解
+
+参数：
+- content: 要记住的信息（具体清晰，≤ 60字）
+- category: 'fact' | 'preference' | 'event' | 'correction' | 'context'
+- subject: 'user' | 'character' | 'world' | 'relationship' | 'other' (可选，默认推断)
+- importance: 1-10 (10 = 关键)
+- confidence: 1-10 (确定程度，默认 = importance)
+- expires_in_days: 可选数字，临时承诺/计划用（"下周去北京"用 7）
+- reason: 为什么值得记住`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const { content, category, importance = 5, reason } = args as StoreMemoryArgs
+        const a = args as StoreMemoryArgs
+        const content = a.content
+        const category = a.category
+        const importance = a.importance ?? 5
+        const confidence = a.confidence ?? importance
+        const subject = a.subject
 
         if (!content || !category) {
             return {
@@ -69,47 +116,85 @@ Parameters:
                 message: '记忆存储失败：缺少必要参数。',
             }
         }
-
-        const validCategories: MemoryCategory[] = ['fact', 'preference', 'event', 'correction', 'context']
-        if (!validCategories.includes(category)) {
+        if (!VALID_CATEGORIES.includes(category)) {
             return {
                 name: 'store_memory',
-                output: { success: false, error: `Invalid category. Must be one of: ${validCategories.join(', ')}` },
+                output: { success: false, error: `Invalid category. Must be one of: ${VALID_CATEGORIES.join(', ')}` },
                 message: '记忆存储失败：无效的分类。',
+            }
+        }
+        if (subject && !VALID_SUBJECTS.includes(subject)) {
+            return {
+                name: 'store_memory',
+                output: { success: false, error: `Invalid subject. Must be one of: ${VALID_SUBJECTS.join(', ')}` },
+                message: '记忆存储失败：无效的主体。',
             }
         }
 
         try {
-            // Check for duplicate/similar content before storing
-            const normalizedContent = content.toLowerCase().replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
-            const existingMemories = await memoryStore.search(content, 5)
+            // Embed up front so dup-detection and storage share the vector
+            const embedding = isEmbeddingsAvailable() ? await embed(content) : null
 
-            for (const existing of existingMemories) {
-                const normalizedExisting = existing.content.toLowerCase().replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+            // 1. Semantic dup detection (preferred path) + lexical fallback
+            const similar: StoredMemory[] = embedding
+                ? await findSimilarByEmbedding(embedding, 0.82, 5)
+                : (await memoryStore.search(content, 5)) as StoredMemory[]
 
-                // Check similarity (if >70% overlap, consider duplicate)
-                const shorter = normalizedContent.length < normalizedExisting.length ? normalizedContent : normalizedExisting
-                const longer = normalizedContent.length >= normalizedExisting.length ? normalizedContent : normalizedExisting
-
-                if (shorter.length > 0 && longer.includes(shorter)) {
-                    // Very similar - update importance if new one is higher
-                    if (importance > existing.importance) {
-                        await memoryStore.update(existing.id, { importance })
-                        return {
-                            name: 'store_memory',
-                            output: { success: true, memoryId: existing.id, updated: true, duplicate: true },
-                            message: `已有相似记忆，已更新重要性：${existing.content.slice(0, 30)}...`,
-                        }
+            for (const existing of similar) {
+                if (looksContradictory(content, existing.content)) {
+                    // Soft-supersede: write new memory, mark old as superseded
+                    const expiresAt = a.expires_in_days
+                        ? Date.now() + a.expires_in_days * 24 * 60 * 60 * 1000
+                        : undefined
+                    const stored = await memoryStore.store(content, category, importance, {
+                        subject,
+                        confidence,
+                        embedding: embedding ?? undefined,
+                        expiresAt,
+                        metadata: { reason: a.reason, supersedes: existing.id },
+                    })
+                    await memoryStore.supersede(existing.id, stored.id)
+                    return {
+                        name: 'store_memory',
+                        output: { success: true, memoryId: stored.id, supersededId: existing.id },
+                        message: `已更新（取代旧记忆）：${content.slice(0, 40)}`,
                     }
+                }
+
+                // Near-duplicate (no contradiction) — bump importance/confidence and skip
+                const lexicalOverlap = sharedNgramRatio(content, existing.content)
+                const isNearDup = embedding
+                    ? true // already passed cosine ≥ 0.82
+                    : lexicalOverlap > 0.65
+
+                if (isNearDup) {
+                    const updates: Partial<Pick<StoredMemory, 'importance' | 'confidence'>> = {}
+                    if (importance > existing.importance) updates.importance = importance
+                    if (confidence > existing.confidence) updates.confidence = confidence
+                    if (Object.keys(updates).length > 0) {
+                        await memoryStore.update(existing.id, updates)
+                    }
+                    // Always record an access — being told again is itself a signal
+                    await memoryStore.recordAccess(existing.id)
                     return {
                         name: 'store_memory',
                         output: { success: true, memoryId: existing.id, duplicate: true },
-                        message: `已有相似记忆，跳过存储：${existing.content.slice(0, 30)}...`,
+                        message: `已有相似记忆，已加强：${existing.content.slice(0, 30)}...`,
                     }
                 }
             }
 
-            const memory = await memoryStore.store(content, category, importance, { reason })
+            // 2. Plain new memory
+            const expiresAt = a.expires_in_days
+                ? Date.now() + a.expires_in_days * 24 * 60 * 60 * 1000
+                : undefined
+            const memory = await memoryStore.store(content, category, importance, {
+                subject,
+                confidence,
+                embedding: embedding ?? undefined,
+                expiresAt,
+                metadata: { reason: a.reason },
+            })
 
             return {
                 name: 'store_memory',
@@ -117,7 +202,9 @@ Parameters:
                     success: true,
                     memoryId: memory.id,
                     category: memory.category,
+                    subject: memory.subject,
                     importance: memory.importance,
+                    confidence: memory.confidence,
                 },
                 message: `已记住：${content.slice(0, 50)}${content.length > 50 ? '...' : ''}`,
             }
@@ -131,25 +218,34 @@ Parameters:
     },
 }
 
-/**
- * Tool for recalling memories based on search query
- */
+function sharedNgramRatio(a: string, b: string): number {
+    const norm = (s: string) => s.replace(/[^一-龥a-zA-Z0-9]/g, '').toLowerCase()
+    const A = norm(a)
+    const B = norm(b)
+    if (A.length < 2 || B.length < 2) return 0
+    let shared = 0
+    for (let i = 0; i < A.length - 1; i++) {
+        if (B.includes(A.slice(i, i + 2))) shared += 1
+    }
+    return shared / (A.length - 1)
+}
+
 export const recallMemoryTool: Tool = {
     name: 'recall_memory',
-    description: `Search long-term memory for relevant information. Use this when:
-- The user asks about something you might have discussed before
-- You need to remember user preferences or past events
-- Looking up previously stored facts or context
-- Checking if you have relevant background information
+    description: `搜索长期记忆。结合关键词、语义和时效性。
 
-Parameters:
-- query: What to search for (keywords or natural language)
-- limit: Maximum number of memories to return (default: 5)
-- category: Optional filter by category`,
+何时使用：
+- 伙伴提及之前讨论过的内容
+- 需要回忆偏好、经历
+- 查找相关背景信息
+
+参数：
+- query: 搜索文本（关键词或自然语言）
+- limit: 最多返回数量（默认 5）
+- category / subject: 可选过滤`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const { query, limit = 5, category } = args as RecallMemoryArgs
-
+        const { query, limit = 5, category, subject } = args as RecallMemoryArgs
         if (!query) {
             return {
                 name: 'recall_memory',
@@ -159,26 +255,12 @@ Parameters:
         }
 
         try {
-            let memories: StoredMemory[]
+            const results = await hybridSearch(query, { limit, category })
+            const filtered = subject ? results.filter(r => r.subject === subject) : results
 
-            if (category) {
-                // Search within a specific category
-                const categoryMemories = await memoryStore.getByCategory(category, 50)
-                // Filter by query relevance
-                const queryLower = query.toLowerCase()
-                memories = categoryMemories
-                    .filter(m => m.content.toLowerCase().includes(queryLower))
-                    .slice(0, limit)
-            } else {
-                // Full-text search across all memories
-                const results = await memoryStore.search(query, limit)
-                memories = results
-            }
+            await Promise.all(filtered.map(m => memoryStore.recordAccess(m.id)))
 
-            // Record access for retrieved memories
-            await Promise.all(memories.map(m => memoryStore.recordAccess(m.id)))
-
-            if (memories.length === 0) {
+            if (filtered.length === 0) {
                 return {
                     name: 'recall_memory',
                     output: { success: true, memories: [], count: 0 },
@@ -186,22 +268,20 @@ Parameters:
                 }
             }
 
-            const formattedMemories = memories.map(m => ({
+            const formatted = filtered.map(m => ({
                 id: m.id,
                 content: m.content,
                 category: m.category,
+                subject: m.subject,
                 importance: m.importance,
+                confidence: m.confidence,
                 date: m.date,
             }))
 
             return {
                 name: 'recall_memory',
-                output: {
-                    success: true,
-                    memories: formattedMemories,
-                    count: memories.length,
-                },
-                message: `找到 ${memories.length} 条相关记忆。`,
+                output: { success: true, memories: formatted, count: filtered.length },
+                message: `找到 ${filtered.length} 条相关记忆。`,
             }
         } catch (error) {
             return {
@@ -213,24 +293,18 @@ Parameters:
     },
 }
 
-/**
- * Tool for forgetting/invalidating memories
- */
 export const forgetMemoryTool: Tool = {
     name: 'forget_memory',
-    description: `Mark a memory as invalid/forgotten. Use this when:
-- A previously stored fact turns out to be incorrect
-- The user corrects misinformation you remembered
-- Information becomes outdated or irrelevant
-- The user explicitly asks you to forget something
+    description: `标记一条记忆为遗忘（软删除，保留审计痕迹）。
 
-Parameters:
-- memoryId: The ID of the memory to forget
-- reason: Why this memory should be forgotten`,
+何时使用：
+- 之前的事实被证实是错的
+- 伙伴更正信息
+- 信息过时
+- 伙伴明确要求忘记`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
         const { memoryId, reason } = args as ForgetMemoryArgs
-
         if (!memoryId) {
             return {
                 name: 'forget_memory',
@@ -238,9 +312,7 @@ Parameters:
                 message: '遗忘操作失败：缺少记忆ID。',
             }
         }
-
         try {
-            // First check if memory exists
             const memory = await memoryStore.getById(memoryId)
             if (!memory) {
                 return {
@@ -249,24 +321,20 @@ Parameters:
                     message: '找不到该记忆。',
                 }
             }
-
-            // Invalidate the memory
-            await memoryStore.invalidate(memoryId)
-
-            // If there's a reason, store it as a correction
+            // Soft delete — invalidate so it stays out of retrieval
+            await memoryStore.update(memoryId, { isValid: 0 })
             if (reason) {
                 await memoryStore.store(
                     `[已遗忘] ${memory.content} - 原因: ${reason}`,
                     'correction',
                     3,
-                    { originalMemoryId: memoryId }
+                    { source: 'agent_reflection', metadata: { originalMemoryId: memoryId } }
                 )
             }
-
             return {
                 name: 'forget_memory',
                 output: { success: true, memoryId, forgotten: memory.content.slice(0, 50) },
-                message: `已遗忘该记忆。`,
+                message: '已遗忘该记忆。',
             }
         } catch (error) {
             return {
@@ -278,25 +346,20 @@ Parameters:
     },
 }
 
-/**
- * Tool for updating existing memories
- */
 export const updateMemoryTool: Tool = {
     name: 'update_memory',
-    description: `Update an existing memory with new information. Use this when:
-- Need to correct or refine a previously stored fact
-- Adjusting the importance of a memory
-- Adding more detail to an existing memory
+    description: `更新已有记忆。
 
-Parameters:
-- memoryId: The ID of the memory to update
-- content: New content (optional, replaces old content)
-- importance: New importance level 1-10 (optional)
-- reason: Why this update is being made`,
+参数：
+- memoryId: 记忆 ID
+- content: 新内容（可选）
+- importance: 新重要性 1-10
+- confidence: 新可信度 1-10
+- reason: 更新原因`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const { memoryId, content, importance, reason } = args as UpdateMemoryArgs
-
+        const a = args as UpdateMemoryArgs
+        const memoryId = a.memoryId
         if (!memoryId) {
             return {
                 name: 'update_memory',
@@ -304,22 +367,27 @@ Parameters:
                 message: '更新操作失败：缺少记忆ID。',
             }
         }
-
-        if (!content && importance === undefined) {
+        if (!a.content && a.importance === undefined && a.confidence === undefined) {
             return {
                 name: 'update_memory',
-                output: { success: false, error: 'Must provide content or importance to update' },
+                output: { success: false, error: 'Must provide content, importance, or confidence to update' },
                 message: '更新操作失败：没有提供更新内容。',
             }
         }
-
         try {
-            const updates: Partial<Pick<StoredMemory, 'content' | 'importance'>> = {}
-            if (content) updates.content = content
-            if (importance !== undefined) updates.importance = importance
+            const updates: Partial<Pick<StoredMemory, 'content' | 'importance' | 'confidence' | 'embedding'>> = {}
+            if (a.content) {
+                updates.content = a.content
+                // Re-embed on content change
+                if (isEmbeddingsAvailable()) {
+                    const newVec = await embed(a.content)
+                    if (newVec) updates.embedding = newVec
+                }
+            }
+            if (a.importance !== undefined) updates.importance = a.importance
+            if (a.confidence !== undefined) updates.confidence = a.confidence
 
             const updated = await memoryStore.update(memoryId, updates)
-
             if (!updated) {
                 return {
                     name: 'update_memory',
@@ -327,7 +395,6 @@ Parameters:
                     message: '找不到该记忆。',
                 }
             }
-
             return {
                 name: 'update_memory',
                 output: {
@@ -335,8 +402,9 @@ Parameters:
                     memoryId,
                     content: updated.content.slice(0, 50),
                     importance: updated.importance,
+                    confidence: updated.confidence,
                 },
-                message: `记忆已更新。`,
+                message: '记忆已更新。',
             }
         } catch (error) {
             return {
@@ -348,53 +416,39 @@ Parameters:
     },
 }
 
-/**
- * Tool for listing memories
- */
 export const listMemoriesTool: Tool = {
     name: 'list_memories',
-    description: `List stored memories. Use this when:
-- Need to review what you remember about the user
-- Looking for memories to potentially update or forget
-- Getting an overview of stored information
-
-Parameters:
-- category: Filter by category (optional)
-- sortBy: 'recent' or 'important' (default: 'recent')
-- limit: Maximum number of memories to return (default: 10)`,
+    description: `列出已有记忆。可按 category/subject 过滤，按 recent/important/strongest 排序。`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const { category, sortBy = 'recent', limit = 10 } = args as ListMemoriesArgs
-
+        const { category, subject, sortBy = 'strongest', limit = 10 } = args as ListMemoriesArgs
         try {
             let memories: StoredMemory[]
-
             if (category) {
                 memories = await memoryStore.getByCategory(category, limit)
+            } else if (subject) {
+                memories = await memoryStore.getBySubject(subject, limit)
             } else if (sortBy === 'important') {
                 memories = await memoryStore.getMostImportant(limit)
-            } else {
+            } else if (sortBy === 'recent') {
                 memories = await memoryStore.getRecent(limit)
+            } else {
+                memories = await memoryStore.getStrongest(limit)
             }
-
             const totalCount = await memoryStore.getCount()
-
-            const formattedMemories = memories.map(m => ({
+            const formatted = memories.map(m => ({
                 id: m.id,
                 content: m.content.slice(0, 100) + (m.content.length > 100 ? '...' : ''),
                 category: m.category,
+                subject: m.subject,
                 importance: m.importance,
+                confidence: m.confidence,
+                strength: Math.round(effectiveStrength(m) * 10) / 10,
                 date: m.date,
             }))
-
             return {
                 name: 'list_memories',
-                output: {
-                    success: true,
-                    memories: formattedMemories,
-                    count: memories.length,
-                    totalCount,
-                },
+                output: { success: true, memories: formatted, count: memories.length, totalCount },
                 message: `共有 ${totalCount} 条记忆，显示 ${memories.length} 条。`,
             }
         } catch (error) {
@@ -408,130 +462,29 @@ Parameters:
 }
 
 type CleanupMemoriesArgs = {
-    strategy?: 'duplicates' | 'outdated' | 'low_importance' | 'all'
+    threshold?: number
     dryRun?: boolean
 }
 
-/**
- * Tool for cleaning up redundant or outdated memories
- */
 export const cleanupMemoriesTool: Tool = {
     name: 'cleanup_memories',
-    description: `Analyze and clean up redundant, outdated, or low-value memories. Use this when:
-- You notice duplicate or very similar memories
-- Some memories seem outdated or no longer relevant
-- Memory count is getting high and needs pruning
-- User asks to organize or clean up memories
+    description: `清理低强度（衰减后）的记忆。强度 = importance × decay + 访问加成。
 
-Parameters:
-- strategy: 'duplicates' (similar content), 'outdated' (old + low access), 'low_importance' (importance <= 3), 'all' (comprehensive)
-- dryRun: If true, only report what would be cleaned without actually removing`,
+参数：
+- threshold: 强度阈值（默认 0.5），低于则清理
+- dryRun: 仅预览不实际清理`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const { strategy = 'all', dryRun = false } = args as CleanupMemoriesArgs
-
+        const { threshold = 0.5, dryRun = false } = (args ?? {}) as CleanupMemoriesArgs
         try {
-            const allMemories = await memoryStore.getRecent(100)
-            const toRemove: { id: string; reason: string; content: string }[] = []
-
-            // 1. Find duplicates (similar content)
-            if (strategy === 'duplicates' || strategy === 'all') {
-                const contentMap = new Map<string, StoredMemory[]>()
-
-                for (const memory of allMemories) {
-                    // Normalize content for comparison
-                    const normalized = memory.content
-                        .toLowerCase()
-                        .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
-                        .slice(0, 50)
-
-                    if (!contentMap.has(normalized)) {
-                        contentMap.set(normalized, [])
-                    }
-                    contentMap.get(normalized)!.push(memory)
-                }
-
-                // Mark duplicates (keep highest importance one)
-                for (const [_, memories] of contentMap) {
-                    if (memories.length > 1) {
-                        memories.sort((a, b) => b.importance - a.importance)
-                        // Keep first (highest importance), mark rest for removal
-                        for (let i = 1; i < memories.length; i++) {
-                            toRemove.push({
-                                id: memories[i].id,
-                                reason: '重复内容',
-                                content: memories[i].content.slice(0, 30),
-                            })
-                        }
-                    }
-                }
-            }
-
-            // 2. Find outdated memories (old + rarely accessed + low importance)
-            if (strategy === 'outdated' || strategy === 'all') {
-                const now = Date.now()
-                const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000
-
-                for (const memory of allMemories) {
-                    const isDuplicate = toRemove.some(r => r.id === memory.id)
-                    if (isDuplicate) continue
-
-                    // Old, rarely accessed, and not important
-                    if (
-                        memory.createdAt < thirtyDaysAgo &&
-                        memory.accessCount < 3 &&
-                        memory.importance <= 4 &&
-                        memory.category !== 'fact' // Don't auto-remove facts
-                    ) {
-                        toRemove.push({
-                            id: memory.id,
-                            reason: '过时且很少访问',
-                            content: memory.content.slice(0, 30),
-                        })
-                    }
-                }
-            }
-
-            // 3. Find low importance memories
-            if (strategy === 'low_importance' || strategy === 'all') {
-                for (const memory of allMemories) {
-                    const isDuplicate = toRemove.some(r => r.id === memory.id)
-                    if (isDuplicate) continue
-
-                    if (
-                        memory.importance <= 2 &&
-                        memory.accessCount < 2 &&
-                        memory.category === 'context' // Only auto-remove context with very low importance
-                    ) {
-                        toRemove.push({
-                            id: memory.id,
-                            reason: '低重要性背景信息',
-                            content: memory.content.slice(0, 30),
-                        })
-                    }
-                }
-            }
-
-            // Execute cleanup if not dry run
-            if (!dryRun && toRemove.length > 0) {
-                for (const item of toRemove) {
-                    await memoryStore.invalidate(item.id)
-                }
-            }
-
-            const summary = toRemove.map(r => `- ${r.content}... (${r.reason})`).join('\n')
-
+            const removed = await memoryStore.pruneDecayed(threshold, dryRun)
+            const summary = removed.map(r => `- ${r.content.slice(0, 30)}... (强度=${r.strength.toFixed(2)})`).join('\n')
             return {
                 name: 'cleanup_memories',
-                output: {
-                    success: true,
-                    removed: toRemove.length,
-                    dryRun,
-                    details: toRemove,
-                },
+                output: { success: true, removed: removed.length, dryRun, details: removed },
                 message: dryRun
-                    ? `发现 ${toRemove.length} 条可清理记忆:\n${summary}`
-                    : `已清理 ${toRemove.length} 条记忆:\n${summary}`,
+                    ? `发现 ${removed.length} 条可清理记忆:\n${summary}`
+                    : `已清理 ${removed.length} 条记忆:\n${summary}`,
             }
         } catch (error) {
             return {
@@ -543,9 +496,6 @@ Parameters:
     },
 }
 
-/**
- * All memory tools bundled together
- */
 export const memoryTools: Tool[] = [
     storeMemoryTool,
     recallMemoryTool,
@@ -556,93 +506,79 @@ export const memoryTools: Tool[] = [
 ]
 
 /**
- * Format memories for injection into system prompt
+ * Render a list of memories for system-prompt injection.
  */
 export function formatMemoriesForPrompt(memories: StoredMemory[]): string {
     if (memories.length === 0) return ''
-
+    const categoryLabels: Record<MemoryCategory, string> = {
+        fact: '事实',
+        preference: '偏好',
+        event: '事件',
+        correction: '纠正',
+        context: '背景',
+    }
+    const subjectLabels: Record<MemorySubject, string> = {
+        user: '伙伴',
+        character: '昔涟',
+        world: '世界',
+        relationship: '关系',
+        other: '其他',
+    }
     const lines = memories.map(m => {
-        const categoryLabel = {
-            fact: '事实',
-            preference: '偏好',
-            event: '事件',
-            correction: '纠正',
-            context: '背景',
-        }[m.category]
-
-        return `- [${categoryLabel}] (${m.date}) ${m.content}`
+        const cat = categoryLabels[m.category]
+        const subj = subjectLabels[m.subject]
+        return `- [${cat}·${subj}] (${m.date}) ${m.content}`
     })
-
     return `\n【长期记忆】\n${lines.join('\n')}\n`
 }
 
 /**
- * Get relevant memories for a given context
- * Uses Flexsearch full-text search + high-importance memories
- * Agent will use recall_memory tool for more specific searches
+ * Hybrid retrieval entrypoint for Agent.run(). Builds the query from the
+ * conversation context (not just the latest user message), runs hybrid
+ * search, optionally LLM-reranks.
  */
 export async function getRelevantMemories(
-    context: string,
+    contextOrQuery: string,
     limit: number = 5
 ): Promise<StoredMemory[]> {
     const seen = new Set<string>()
-    const candidates: StoredMemory[] = []
+    const results: StoredMemory[] = []
 
-    // 1. Direct Flexsearch full-text search
-    const directResults = await memoryStore.search(context, limit * 2)
-    for (const memory of directResults) {
-        if (!seen.has(memory.id)) {
-            seen.add(memory.id)
-            candidates.push(memory)
+    const hybrid = await hybridSearch(contextOrQuery, { limit: limit * 2 })
+    for (const m of hybrid) {
+        if (!seen.has(m.id)) {
+            seen.add(m.id)
+            results.push(m)
         }
     }
 
-    // 2. Add high-importance memories (always relevant)
-    const importantMemories = await memoryStore.getMostImportant(3)
-    for (const memory of importantMemories) {
-        if (!seen.has(memory.id)) {
-            seen.add(memory.id)
-            candidates.push(memory)
+    // Always pin top-strength memories so the agent has user-name-level facts available
+    const strongest = await memoryStore.getStrongest(3)
+    for (const m of strongest) {
+        if (!seen.has(m.id)) {
+            seen.add(m.id)
+            results.push(m)
         }
     }
 
-    // 3. Sort by importance tiers
-    if (candidates.length > limit) {
-        // Shuffle candidates to add variety
-        for (let i = candidates.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1))
-            ;[candidates[i], candidates[j]] = [candidates[j], candidates[i]]
-        }
-
-        // Sort by importance (higher first)
-        candidates.sort((a, b) => {
-            const tierA = Math.floor((a.importance - 1) / 3)
-            const tierB = Math.floor((b.importance - 1) / 3)
-            return tierB - tierA
-        })
-    }
-
-    return candidates.slice(0, limit)
+    return results.slice(0, limit)
 }
 
 /**
- * Get memories suitable for generating an initial greeting
- * Returns high-importance facts and preferences about the user
+ * Memories suitable for an opening greeting: high-importance facts and
+ * preferences about the user, plus recent significant relationship events.
  */
 export async function getGreetingMemories(): Promise<StoredMemory[]> {
     const memories: StoredMemory[] = []
     const seen = new Set<string>()
 
-    // Get high-importance facts (like user's name)
     const facts = await memoryStore.getByCategory('fact', 10)
-    for (const m of facts.filter(f => f.importance >= 7)) {
+    for (const m of facts.filter(f => f.importance >= 7 && f.subject === 'user')) {
         if (!seen.has(m.id)) {
             seen.add(m.id)
             memories.push(m)
         }
     }
-
-    // Get important preferences
     const preferences = await memoryStore.getByCategory('preference', 5)
     for (const m of preferences.filter(p => p.importance >= 6)) {
         if (!seen.has(m.id)) {
@@ -650,8 +586,6 @@ export async function getGreetingMemories(): Promise<StoredMemory[]> {
             memories.push(m)
         }
     }
-
-    // Get recent significant events
     const events = await memoryStore.getByCategory('event', 3)
     for (const m of events.filter(e => e.importance >= 7)) {
         if (!seen.has(m.id)) {
@@ -659,7 +593,5 @@ export async function getGreetingMemories(): Promise<StoredMemory[]> {
             memories.push(m)
         }
     }
-
-    // Sort by importance descending
-    return memories.sort((a, b) => b.importance - a.importance).slice(0, 5)
+    return memories.sort((a, b) => effectiveStrength(b) - effectiveStrength(a)).slice(0, 5)
 }

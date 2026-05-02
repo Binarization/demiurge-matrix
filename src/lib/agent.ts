@@ -2,6 +2,9 @@ import type { ChatMessage } from './openrouter'
 import { OpenRouterClient } from './openrouter'
 import { memoryStore, type StoredMemory } from './memory-store'
 import { formatMemoriesForPrompt, getRelevantMemories, memoryTools } from './memory-tools'
+import { hybridSearch, rerankWithLLM } from './memory-search'
+import { embed, isEmbeddingsAvailable } from './embeddings'
+import { reflect } from './reflection'
 
 type ToolExecutionContext = {
     addMemory: (entry: MemoryEntry) => void
@@ -50,10 +53,22 @@ type AgentOptions = {
     tools?: Tool[]
     maxRecursions?: number
     client?: OpenRouterClient
-    maxContextMessages?: number // Maximum conversation turns to keep (default: 20)
-    enableMemoryTools?: boolean // Whether to enable built-in memory tools (default: true)
-    autoInjectMemories?: boolean // Whether to auto-inject relevant memories (default: true)
-    maxInjectedMemories?: number // Maximum memories to inject per request (default: 5)
+    /** Conversation turns to keep in history (default: 20). */
+    maxContextMessages?: number
+    /** Register the built-in memory tools (default: true). */
+    enableMemoryTools?: boolean
+    /** Auto-inject relevant memories into the system prompt (default: true). */
+    autoInjectMemories?: boolean
+    /** Maximum memories to inject per request (default: 5). */
+    maxInjectedMemories?: number
+    /** LLM-rerank the hybrid candidates for better precision (default: true). */
+    enableRerank?: boolean
+    /** Run reflection pass after each turn (default: true). */
+    enableReflection?: boolean
+    /** Summarize old turns into an episodic memory before trimming (default: true). */
+    enableEpisodicSummary?: boolean
+    /** Cheap model for reflection/rerank/summary. Falls back to main model. */
+    auxiliaryModel?: string
 }
 
 type AgentRunOptions = {
@@ -88,6 +103,18 @@ type OpenRouterToolDefinition = {
     }
 }
 
+const MEMORY_TOOL_NAMES = new Set([
+    'store_memory',
+    'recall_memory',
+    'forget_memory',
+    'update_memory',
+    'list_memories',
+    'cleanup_memories',
+])
+
+const CATEGORY_ENUM = ['fact', 'preference', 'event', 'correction', 'context']
+const SUBJECT_ENUM = ['user', 'character', 'world', 'relationship', 'other']
+
 export class Agent {
     private readonly baseSystemPrompt: string
     private readonly model?: string
@@ -96,10 +123,15 @@ export class Agent {
     private readonly maxContextMessages: number
     private readonly autoInjectMemories: boolean
     private readonly maxInjectedMemories: number
+    private readonly enableRerank: boolean
+    private readonly enableReflection: boolean
+    private readonly enableEpisodicSummary: boolean
+    private readonly auxiliaryModel?: string
     private readonly toolRegistry = new Map<string, Tool>()
     private readonly history: ChatMessage[] = []
     private readonly memory: MemoryEntry[] = []
     private injectedMemories: StoredMemory[] = []
+    private lastUserInput = ''
 
     constructor(options: AgentOptions) {
         this.baseSystemPrompt = options.systemPrompt
@@ -108,19 +140,17 @@ export class Agent {
         this.maxContextMessages = options.maxContextMessages ?? 20
         this.autoInjectMemories = options.autoInjectMemories ?? true
         this.maxInjectedMemories = options.maxInjectedMemories ?? 5
+        this.enableRerank = options.enableRerank ?? true
+        this.enableReflection = options.enableReflection ?? true
+        this.enableEpisodicSummary = options.enableEpisodicSummary ?? true
+        this.auxiliaryModel = options.auxiliaryModel
         this.client = options.client ?? new OpenRouterClient({ model: options.model })
 
-        // Register user-provided tools
-        options.tools?.forEach(tool => {
-            this.registerTool(tool)
-        })
+        options.tools?.forEach(tool => this.registerTool(tool))
 
-        // Register memory tools if enabled (default: true)
         if (options.enableMemoryTools !== false) {
             memoryTools.forEach(tool => {
-                if (!this.toolRegistry.has(tool.name)) {
-                    this.registerTool(tool)
-                }
+                if (!this.toolRegistry.has(tool.name)) this.registerTool(tool)
             })
         }
     }
@@ -152,51 +182,35 @@ export class Agent {
     }
 
     /**
-     * Build the system prompt with injected memories
+     * Build the system prompt — base prompt + tool instructions + injected
+     * memory section (if auto-injection is on).
      */
     private buildSystemPrompt(injectedMemories: StoredMemory[]): string {
-        const memorySection = formatMemoriesForPrompt(injectedMemories)
+        const memorySection = this.autoInjectMemories ? formatMemoriesForPrompt(injectedMemories) : ''
 
-        // Add memory tool instructions
         const memoryInstructions = `
 【记忆管理 - 主动维护】
-你拥有长期记忆能力，必须主动使用！不仅要存储，还要删除和更新。
+你拥有长期记忆能力，必须主动使用！
 
 可用工具：
-- store_memory: 存储新信息 | forget_memory: 删除记忆 | update_memory: 更新记忆
-- recall_memory: 搜索记忆 | list_memories: 列出记忆 | cleanup_memories: 批量清理
+- store_memory（content, category, subject?, importance, confidence?, expires_in_days?）
+- forget_memory / update_memory（修改既有记忆）
+- recall_memory（混合检索：关键词+语义+时效）
+- list_memories（按 strongest/recent/important 排序）
+- cleanup_memories（按强度阈值清理衰减记忆）
 
-⚡ 立即存储：
-• 名字、身份、职业 → fact (9-10) | 喜好、偏好 → preference (7-8)
-• 重要人物、宠物 → fact (8) | 经历、故事 → event (6-8)
-• 目标、计划 → fact (7-8) | 习惯、作息 → preference (6-7)
+⚡ 立即存储：姓名/身份 → fact (importance 9-10) | 偏好 → preference (7-8)
+🗑️ 立即更正：与已有记忆矛盾时 → store_memory 会自动取代旧记忆，无需手动 forget
+🔄 临时计划：用 expires_in_days 标注（如"下周去北京"用 7）
+🚫 不需要记忆：闲聊、问候、临时话题
 
-🗑️ 立即删除（forget_memory）：
-• 用户说"不对/错了/我改变想法了" → 删除旧记忆
-• 发现矛盾信息 → 删除错误的那条
-• 用户明确要求忘记某事 → 立即删除
-• 过时的信息（如：旧地址、前任工作）→ 删除
-
-🔄 立即更新（update_memory）：
-• 用户更正信息 → 更新而不是新建
-• 偏好变化（"我现在喜欢X了"）→ 更新原记忆
-• 重要性变化 → 调整 importance 值
-
-🧹 定期清理（cleanup_memories）：
-• 记忆数量多时主动清理重复和低价值记忆
-• 可以先用 dryRun: true 预览
-
-🚫 不需要记忆：闲聊、问候、临时话题、已存在的记忆
-
-重要性：10=核心身份 | 8-9=重要 | 6-7=一般 | 4-5=背景 | 1-3=临时
+importance：10=核心身份 | 8-9=重要 | 6-7=一般 | 4-5=背景 | 1-3=临时
+confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
 `
 
         return this.baseSystemPrompt + memoryInstructions + memorySection
     }
 
-    /**
-     * Get tool definitions for OpenRouter API
-     */
     private getToolDefinitions(): OpenRouterToolDefinition[] {
         const definitions: OpenRouterToolDefinition[] = []
 
@@ -204,72 +218,52 @@ export class Agent {
             const properties: Record<string, unknown> = {}
             const required: string[] = []
 
-            // Memory tools have specific parameter schemas
             if (tool.name === 'store_memory') {
-                properties.content = { type: 'string', description: 'The information to remember' }
-                properties.category = {
-                    type: 'string',
-                    enum: ['fact', 'preference', 'event', 'correction', 'context'],
-                    description: 'Category of the memory',
-                }
-                properties.importance = {
-                    type: 'number',
-                    description: 'Importance level 1-10',
-                }
-                properties.reason = { type: 'string', description: 'Why this is worth remembering' }
+                properties.content = { type: 'string', description: '要记住的信息（≤60字）' }
+                properties.category = { type: 'string', enum: CATEGORY_ENUM, description: '记忆类型' }
+                properties.subject = { type: 'string', enum: SUBJECT_ENUM, description: '关于谁/什么（默认推断）' }
+                properties.importance = { type: 'number', description: '重要性 1-10' }
+                properties.confidence = { type: 'number', description: '可信度 1-10（默认=importance）' }
+                properties.expires_in_days = { type: 'number', description: '过期天数（仅临时承诺/计划）' }
+                properties.reason = { type: 'string', description: '为什么值得记住' }
                 required.push('content', 'category')
             } else if (tool.name === 'recall_memory') {
-                properties.query = { type: 'string', description: 'Search query for memories' }
-                properties.limit = { type: 'number', description: 'Maximum results to return' }
-                properties.category = {
-                    type: 'string',
-                    enum: ['fact', 'preference', 'event', 'correction', 'context'],
-                    description: 'Filter by category',
-                }
+                properties.query = { type: 'string', description: '搜索文本' }
+                properties.limit = { type: 'number', description: '最大返回数量' }
+                properties.category = { type: 'string', enum: CATEGORY_ENUM, description: '过滤类别' }
+                properties.subject = { type: 'string', enum: SUBJECT_ENUM, description: '过滤主体' }
                 required.push('query')
             } else if (tool.name === 'forget_memory') {
-                properties.memoryId = { type: 'string', description: 'ID of the memory to forget' }
-                properties.reason = { type: 'string', description: 'Why this should be forgotten' }
+                properties.memoryId = { type: 'string', description: '记忆 ID' }
+                properties.reason = { type: 'string', description: '原因' }
                 required.push('memoryId')
             } else if (tool.name === 'update_memory') {
-                properties.memoryId = { type: 'string', description: 'ID of the memory to update' }
-                properties.content = { type: 'string', description: 'New content for the memory' }
-                properties.importance = { type: 'number', description: 'New importance level' }
-                properties.reason = { type: 'string', description: 'Why this update is needed' }
+                properties.memoryId = { type: 'string', description: '记忆 ID' }
+                properties.content = { type: 'string', description: '新内容' }
+                properties.importance = { type: 'number', description: '新重要性 1-10' }
+                properties.confidence = { type: 'number', description: '新可信度 1-10' }
+                properties.reason = { type: 'string', description: '原因' }
                 required.push('memoryId')
             } else if (tool.name === 'list_memories') {
-                properties.category = {
-                    type: 'string',
-                    enum: ['fact', 'preference', 'event', 'correction', 'context'],
-                    description: 'Filter by category',
-                }
+                properties.category = { type: 'string', enum: CATEGORY_ENUM, description: '过滤类别' }
+                properties.subject = { type: 'string', enum: SUBJECT_ENUM, description: '过滤主体' }
                 properties.sortBy = {
                     type: 'string',
-                    enum: ['recent', 'important'],
-                    description: 'Sort order',
+                    enum: ['recent', 'important', 'strongest'],
+                    description: '排序方式',
                 }
-                properties.limit = { type: 'number', description: 'Maximum results' }
+                properties.limit = { type: 'number', description: '最大返回数量' }
             } else if (tool.name === 'cleanup_memories') {
-                properties.strategy = {
-                    type: 'string',
-                    enum: ['duplicates', 'outdated', 'low_importance', 'all'],
-                    description: 'Cleanup strategy: duplicates, outdated, low_importance, or all',
-                }
-                properties.dryRun = {
-                    type: 'boolean',
-                    description: 'If true, only report what would be cleaned without removing',
-                }
+                properties.threshold = { type: 'number', description: '强度阈值，低于则清理（默认 0.5）' }
+                properties.dryRun = { type: 'boolean', description: '仅预览不删除' }
             } else if (tool.parameters) {
-                // Use custom parameters if defined
                 for (const [key, param] of Object.entries(tool.parameters)) {
                     properties[key] = {
                         type: param.type,
                         description: param.description,
                         ...(param.enum ? { enum: param.enum } : {}),
                     }
-                    if (param.required) {
-                        required.push(key)
-                    }
+                    if (param.required) required.push(key)
                 }
             }
 
@@ -278,11 +272,7 @@ export class Agent {
                 function: {
                     name: tool.name,
                     description: tool.description,
-                    parameters: {
-                        type: 'object',
-                        properties,
-                        required,
-                    },
+                    parameters: { type: 'object', properties, required },
                 },
             })
         }
@@ -291,26 +281,18 @@ export class Agent {
     }
 
     /**
-     * Trim history to respect context window limit
-     * Keeps the system message and most recent messages
+     * Trim history. Optionally summarizes the dropped tail into an episodic
+     * memory before discarding so the long-term store retains the gist.
      */
-    private trimHistory(): void {
-        // Count user/assistant message pairs (excluding system and tool messages)
-        const conversationMessages = this.history.filter(
-            m => m.role === 'user' || m.role === 'assistant'
-        )
-
-        // Each "turn" is a user message + assistant response
+    private async trimHistory(): Promise<void> {
+        const conversationMessages = this.history.filter(m => m.role === 'user' || m.role === 'assistant')
         const turns = Math.floor(conversationMessages.length / 2)
+        if (turns <= this.maxContextMessages) return
 
-        if (turns <= this.maxContextMessages) {
-            return // No trimming needed
-        }
-
-        // Find how many messages to remove
         const messagesToRemove = (turns - this.maxContextMessages) * 2
 
-        // Find the first non-system message index
+        // Collect the tail-to-be-dropped for summarization
+        const tailToDrop: ChatMessage[] = []
         let firstNonSystemIdx = 0
         for (let i = 0; i < this.history.length; i++) {
             if (this.history[i].role !== 'system') {
@@ -319,44 +301,90 @@ export class Agent {
             }
         }
 
-        // Remove old messages (keep system prompt)
-        let removed = 0
+        let collected = 0
         let i = firstNonSystemIdx
-        while (removed < messagesToRemove && i < this.history.length) {
+        const removeIndices: number[] = []
+        while (collected < messagesToRemove && i < this.history.length) {
             const msg = this.history[i]
             if (msg.role === 'user' || msg.role === 'assistant') {
-                this.history.splice(i, 1)
-                removed++
+                tailToDrop.push(msg)
+                removeIndices.push(i)
+                collected++
             } else if (msg.role === 'tool') {
-                // Also remove orphaned tool messages
-                this.history.splice(i, 1)
-            } else {
-                i++
+                // Drop orphaned tool messages alongside their owning turn
+                removeIndices.push(i)
             }
+            i++
+        }
+
+        // Episodic summary before removal
+        if (this.enableEpisodicSummary && tailToDrop.length >= 2) {
+            try {
+                await this.summarizeIntoEpisodicMemory(tailToDrop)
+            } catch (err) {
+                console.warn('[Agent] episodic summary failed:', err)
+            }
+        }
+
+        // Remove in reverse to preserve indices
+        for (let j = removeIndices.length - 1; j >= 0; j--) {
+            this.history.splice(removeIndices[j], 1)
         }
     }
 
-    /**
-     * Build messages for API call, including system prompt with memories
-     */
+    private async summarizeIntoEpisodicMemory(turns: ChatMessage[]): Promise<void> {
+        const transcript = turns
+            .map(m => `${m.role === 'user' ? '伙伴' : '昔涟'}：${m.content}`)
+            .join('\n')
+
+        const system = `把下面这段对话浓缩成一句客观摘要（≤80字），用于长期记忆。只输出摘要文本，不要前缀。`
+        const response = await this.client.sendChat(
+            [
+                { role: 'system', content: system },
+                { role: 'user', content: transcript },
+            ],
+            { model: this.auxiliaryModel ?? this.model }
+        )
+        const summary = (response as any)?.choices?.[0]?.message?.content?.trim()
+        if (!summary || summary.length === 0) return
+
+        const embedding = isEmbeddingsAvailable() ? await embed(summary) : null
+        await memoryStore.store(summary, 'event', 5, {
+            subject: 'relationship',
+            source: 'agent_reflection',
+            confidence: 7,
+            embedding: embedding ?? undefined,
+            metadata: { kind: 'episodic_summary', turnCount: turns.length },
+        })
+    }
+
     private buildMessagesForAPI(systemPrompt: string): ChatMessage[] {
-        // Start with the dynamic system prompt
         const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt }]
-
-        // Add conversation history (excluding the original system message)
         for (const msg of this.history) {
-            if (msg.role !== 'system') {
-                messages.push(msg)
-            }
+            if (msg.role !== 'system') messages.push(msg)
         }
-
         return messages
     }
 
-    async run(userInput: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
-        // Trim history before adding new message
-        this.trimHistory()
+    /**
+     * Construct the retrieval query from recent conversation. A short user
+     * turn like "为什么？" yields nothing on its own — joining the last 2-3
+     * turns gives the retriever real signal.
+     */
+    private buildRetrievalQuery(latestInput: string): string {
+        const recent = this.history
+            .filter(m => m.role === 'user' || m.role === 'assistant')
+            .slice(-4)
+            .map(m => m.content)
+            .filter(Boolean)
+        return [...recent, latestInput].join(' ')
+    }
 
+    async run(userInput: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
+        await this.trimHistory()
+
+        this.lastUserInput = userInput
+        const retrievalQuery = this.buildRetrievalQuery(userInput)
         this.history.push({ role: 'user', content: userInput })
 
         const maxRecursions = options.maxRecursions ?? this.maxRecursions
@@ -364,35 +392,36 @@ export class Agent {
         let finalContent = ''
         let lastRaw: unknown
 
-        // Get relevant memories for this context
+        // Hybrid retrieval + optional LLM rerank
         if (this.autoInjectMemories) {
             try {
-                this.injectedMemories = await getRelevantMemories(
-                    userInput,
-                    this.maxInjectedMemories
-                )
+                const candidates = await hybridSearch(retrievalQuery, {
+                    limit: this.maxInjectedMemories * 2,
+                })
+                if (this.enableRerank && candidates.length > this.maxInjectedMemories) {
+                    this.injectedMemories = await rerankWithLLM(retrievalQuery, candidates, {
+                        client: this.client,
+                        model: this.auxiliaryModel ?? this.model,
+                        limit: this.maxInjectedMemories,
+                        contextHint: userInput,
+                    })
+                } else {
+                    // Fall back to hybrid + pinned strongest
+                    this.injectedMemories = await getRelevantMemories(retrievalQuery, this.maxInjectedMemories)
+                }
             } catch (error) {
                 console.warn('Failed to get relevant memories:', error)
                 this.injectedMemories = []
             }
+        } else {
+            this.injectedMemories = []
         }
 
-        // Build system prompt with memories
         const systemPrompt = this.buildSystemPrompt(this.injectedMemories)
-
-        // Get tool definitions
         const tools = this.getToolDefinitions()
-
-        // Debug: log tool definitions
-        if (tools.length > 0) {
-            console.log('[Agent] Tools registered:', tools.map(t => t.function.name))
-        }
 
         while (iterations < maxRecursions) {
             const messages = this.buildMessagesForAPI(systemPrompt)
-
-            // Debug: log message count
-            console.log('[Agent] Iteration', iterations, '- Sending', messages.length, 'messages')
 
             /* eslint-disable no-await-in-loop */
             const response: any = await this.client.sendChat(messages, {
@@ -402,47 +431,22 @@ export class Agent {
             })
             lastRaw = response
 
-            // Debug: log raw response details
-            const finishReason = response?.choices?.[0]?.finish_reason
-            console.log('[Agent] Response finish_reason:', finishReason)
-
             const assistantMessage = response?.choices?.[0]?.message
             if (!assistantMessage) {
                 throw new Error('OpenRouter response missing assistant message.')
             }
 
-            // Debug: log raw assistant message
-            console.log('[Agent] Assistant message:', {
-                hasContent: !!assistantMessage.content,
-                contentLength: assistantMessage.content?.length ?? 0,
-                hasToolCalls: !!assistantMessage.tool_calls,
-                toolCallsCount: assistantMessage.tool_calls?.length ?? 0,
-                rawMessage: JSON.stringify(assistantMessage),
-            })
-
             const { content, toolCalls, rawToolCalls } = this.normalizeAssistantMessage(assistantMessage)
 
-            // Debug: log tool calls
             if (toolCalls.length > 0) {
-                console.log('[Agent] Tool calls requested:', toolCalls.map(t => ({ name: t.name, id: t.id })))
-            }
-
-            // Execute any tool calls
-            if (toolCalls.length > 0) {
-                // Always add assistant message with tool_calls to history first
                 this.history.push({
                     role: 'assistant',
                     content: content || '',
                     tool_calls: rawToolCalls,
                 })
 
-                // Execute tools
                 const toolResults = await this.executeToolCalls(toolCalls)
 
-                // Debug: log tool results
-                console.log('[Agent] Tool results:', toolResults.map(r => ({ name: r.name, success: (r.output as any)?.success })))
-
-                // Always add tool results to history
                 for (const result of toolResults) {
                     const toolContent =
                         result.message ??
@@ -451,66 +455,54 @@ export class Agent {
                             : JSON.stringify(result.output, null, 2))
                     const toolCallId = result.toolCallId
 
-                    console.log('[Agent] Adding tool result to history:', { name: result.name, toolCallId })
-
                     this.history.push({
                         role: 'tool',
                         content: toolContent,
                         name: result.name,
                         toolCallId,
-                        tool_call_id: toolCallId,  // SDK may expect snake_case
+                        tool_call_id: toolCallId,
                     })
 
-                    if (result.memoryEntry) {
-                        this.addMemory(result.memoryEntry)
-                    }
+                    if (result.memoryEntry) this.addMemory(result.memoryEntry)
                 }
 
-                // If we have content, use it as the response
-                if (content) {
-                    finalContent = content
-                }
+                if (content) finalContent = content
 
-                // Check if all tool calls are memory-related (fire-and-forget)
-                const isAllMemoryTools = toolCalls.every(tc =>
-                    ['store_memory', 'recall_memory', 'forget_memory', 'update_memory', 'list_memories', 'cleanup_memories'].includes(tc.name)
-                )
+                const isAllMemoryTools = toolCalls.every(tc => MEMORY_TOOL_NAMES.has(tc.name))
+                if (content && isAllMemoryTools) break
+                if (content) break
 
-                // If we have content and all tools are memory tools, we're done
-                if (content && isAllMemoryTools) {
-                    console.log('[Agent] Content received with memory tools - done')
-                    break
-                }
-
-                // If we have content already, we're done (tools were side effects)
-                if (content) {
-                    console.log('[Agent] Content already received, tools executed as side effects - done')
-                    break
-                }
-
-                // No content - continue loop to get model's response after tool execution
                 iterations += 1
-                console.log('[Agent] No content yet, continuing to iteration', iterations)
                 continue
             }
 
-            // No tool calls - just add assistant content to history
             if (content) {
                 this.history.push({ role: 'assistant', content })
                 finalContent = content
             }
-
-            // No tool calls and no content - unusual, but break to avoid infinite loop
-            if (!content) {
-                console.log('[Agent] No content and no tool calls - breaking')
-            }
             break
         }
 
-        return {
-            content: finalContent,
-            raw: lastRaw,
+        // Fire-and-forget reflection. Errors in here must not affect the user.
+        if (this.enableReflection && finalContent) {
+            const priorContext = this.history
+                .filter(m => m.role === 'user' || m.role === 'assistant')
+                .slice(-6, -2)
+                .map(m => `${m.role === 'user' ? '伙伴' : '昔涟'}：${m.content}`)
+            void reflect(
+                {
+                    userMessage: userInput,
+                    assistantMessage: finalContent,
+                    priorContext,
+                },
+                {
+                    client: this.client,
+                    model: this.auxiliaryModel ?? this.model,
+                }
+            ).catch(err => console.warn('[Agent] reflection failed:', err))
         }
+
+        return { content: finalContent, raw: lastRaw }
     }
 
     private async executeToolCalls(toolCalls: ToolCallRequest[]) {
@@ -532,7 +524,6 @@ export class Agent {
                     addMemory: entry => this.addMemory(entry),
                     memory: this.memory,
                 })
-                // Ensure output always has success field
                 const normalizedOutput = typeof output.output === 'object' && output.output !== null
                     ? { success: true, ...output.output }
                     : { success: true, result: output.output }
@@ -566,58 +557,38 @@ export class Agent {
         rawToolCalls: OpenRouterToolCall[]
     } {
         const content = Array.isArray(message.content)
-            ? message.content
-                  .map((chunk: any) => chunk?.text ?? '')
-                  .join('\n')
-                  .trim()
+            ? message.content.map((chunk: any) => chunk?.text ?? '').join('\n').trim()
             : (message.content ?? '')
 
-        // OpenRouter SDK might use either tool_calls or toolCalls
         const rawToolCalls: OpenRouterToolCall[] = message.tool_calls ?? message.toolCalls ?? []
-
-        console.log('[Agent] normalizeAssistantMessage - tool_calls:', message.tool_calls, 'toolCalls:', message.toolCalls, 'result:', rawToolCalls)
 
         const toolCalls: ToolCallRequest[] = rawToolCalls.map(toolCall => {
             let parsedArgs: Record<string, unknown> = {}
             try {
-                parsedArgs = toolCall.function.arguments
-                    ? JSON.parse(toolCall.function.arguments)
-                    : {}
+                parsedArgs = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {}
             } catch (error) {
                 parsedArgs = {
                     error: 'Failed to parse tool arguments',
                     raw: toolCall.function.arguments,
                 }
             }
-            return {
-                id: toolCall.id,
-                name: toolCall.function.name,
-                arguments: parsedArgs,
-            }
+            return { id: toolCall.id, name: toolCall.function.name, arguments: parsedArgs }
         })
 
         return { content, toolCalls, rawToolCalls }
     }
 
-    /**
-     * Get the current injected memories
-     */
     getInjectedMemories(): ReadonlyArray<StoredMemory> {
         return this.injectedMemories
     }
 
-    /**
-     * Get memory statistics
-     */
     async getMemoryStats(): Promise<{ count: number; categories: Record<string, number> }> {
         const count = await memoryStore.getCount()
         const categories: Record<string, number> = {}
-
         for (const cat of ['fact', 'preference', 'event', 'correction', 'context'] as const) {
             const catMemories = await memoryStore.getByCategory(cat, 1000)
             categories[cat] = catMemories.length
         }
-
         return { count, categories }
     }
 }
