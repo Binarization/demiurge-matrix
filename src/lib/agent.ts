@@ -1,3 +1,4 @@
+import { consumeChatStream } from './chat-stream'
 import type { ChatMessage } from './openrouter'
 import { OpenRouterClient } from './openrouter'
 import { memoryStore, type StoredMemory } from './memory-store'
@@ -68,11 +69,15 @@ type AgentOptions = {
     enableEpisodicSummary?: boolean
     /** Cheap model for reflection/rerank/summary. Falls back to main model. */
     auxiliaryModel?: string
+    initialHistory?: ChatMessage[]
 }
 
 type AgentRunOptions = {
     maxRecursions?: number
     stream?: boolean
+    onDelta?: (text: string) => void
+    signal?: AbortSignal
+    interactionContext?: string
 }
 
 export type AgentRunResult = {
@@ -102,15 +107,6 @@ type OpenRouterToolDefinition = {
     }
 }
 
-const MEMORY_TOOL_NAMES = new Set([
-    'store_memory',
-    'recall_memory',
-    'forget_memory',
-    'update_memory',
-    'list_memories',
-    'cleanup_memories',
-])
-
 const CATEGORY_ENUM = ['fact', 'preference', 'event', 'correction', 'context']
 const SUBJECT_ENUM = ['user', 'character', 'world', 'relationship', 'other']
 
@@ -130,7 +126,6 @@ export class Agent {
     private readonly history: ChatMessage[] = []
     private readonly memory: MemoryEntry[] = []
     private injectedMemories: StoredMemory[] = []
-    private lastUserInput = ''
 
     constructor(options: AgentOptions) {
         this.baseSystemPrompt = options.systemPrompt
@@ -144,6 +139,7 @@ export class Agent {
         this.enableEpisodicSummary = options.enableEpisodicSummary ?? true
         this.auxiliaryModel = options.auxiliaryModel
         this.client = options.client ?? new OpenRouterClient({ model: options.model })
+        this.history.push(...(options.initialHistory ?? []).map(message => ({ ...message })))
 
         options.tools?.forEach(tool => this.registerTool(tool))
 
@@ -284,37 +280,16 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
      * memory before discarding so the long-term store retains the gist.
      */
     private async trimHistory(): Promise<void> {
-        const conversationMessages = this.history.filter(m => m.role === 'user' || m.role === 'assistant')
-        const turns = Math.floor(conversationMessages.length / 2)
-        if (turns <= this.maxContextMessages) return
-
-        const messagesToRemove = (turns - this.maxContextMessages) * 2
-
-        // Collect the tail-to-be-dropped for summarization
-        const tailToDrop: ChatMessage[] = []
-        let firstNonSystemIdx = 0
-        for (let i = 0; i < this.history.length; i++) {
-            if (this.history[i].role !== 'system') {
-                firstNonSystemIdx = i
-                break
-            }
-        }
-
-        let collected = 0
-        let i = firstNonSystemIdx
-        const removeIndices: number[] = []
-        while (collected < messagesToRemove && i < this.history.length) {
-            const msg = this.history[i]
-            if (msg.role === 'user' || msg.role === 'assistant') {
-                tailToDrop.push(msg)
-                removeIndices.push(i)
-                collected++
-            } else if (msg.role === 'tool') {
-                // Drop orphaned tool messages alongside their owning turn
-                removeIndices.push(i)
-            }
-            i++
-        }
+        // A turn starts at a user message and includes every tool round and
+        // the final answer. Never split a tool call from its result.
+        const turnStarts = this.history.flatMap((message, index) =>
+            message.role === 'user' ? [index] : []
+        )
+        const keepTurns = Math.max(0, Math.floor(this.maxContextMessages))
+        if (turnStarts.length <= keepTurns) return
+        const cutIndex = turnStarts[turnStarts.length - keepTurns] ?? this.history.length
+        const tailToDrop = this.history.slice(0, cutIndex)
+            .filter(message => message.role === 'user' || message.role === 'assistant')
 
         // Episodic summary before removal
         if (this.enableEpisodicSummary && tailToDrop.length >= 2) {
@@ -325,10 +300,7 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
             }
         }
 
-        // Remove in reverse to preserve indices
-        for (let j = removeIndices.length - 1; j >= 0; j--) {
-            this.history.splice(removeIndices[j], 1)
-        }
+        this.history.splice(0, cutIndex)
     }
 
     private async summarizeIntoEpisodicMemory(turns: ChatMessage[]): Promise<void> {
@@ -381,9 +353,10 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
     }
 
     async run(userInput: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
+        options.signal?.throwIfAborted()
         await this.trimHistory()
+        options.signal?.throwIfAborted()
 
-        this.lastUserInput = userInput
         const retrievalQuery = this.buildRetrievalQuery(userInput)
         this.history.push({ role: 'user', content: userInput })
 
@@ -417,18 +390,33 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
             this.injectedMemories = []
         }
 
-        const systemPrompt = this.buildSystemPrompt(this.injectedMemories)
+        options.signal?.throwIfAborted()
+        const systemPrompt = this.buildSystemPrompt(this.injectedMemories) +
+            (options.interactionContext ? `\n【本次交互状态】\n${options.interactionContext}` : '')
         const tools = this.getToolDefinitions()
 
-        while (iterations < maxRecursions) {
-            const messages = this.buildMessagesForAPI(systemPrompt)
+        // Tools run before the public answer: speech cannot retract a tool preamble.
+        // The explicit finish tool lets planning stop without generating an unused answer.
+        const responseTool = {
+            type: 'function', function: { name: 'begin_response',
+                description: '信息已经足够，开始给伙伴回复。不需要查询或记忆操作时立即选择此工具，不要生成回复正文。',
+                parameters: { type: 'object', properties: {}, additionalProperties: false } },
+        }
+        while (iterations < maxRecursions && (!options.stream || tools.length > 0)) {
+            options.signal?.throwIfAborted()
+            const messages = this.buildMessagesForAPI(systemPrompt + (options.stream
+                ? '\n当前仅决定必要的工具操作，不输出面向伙伴的正文。已有信息足够时调用 begin_response。不要为了调用工具而查询；日常问候直接 begin_response。'
+                : ''))
 
             /* eslint-disable no-await-in-loop */
             const response: any = await this.client.sendChat(messages, {
                 model: this.model,
-                stream: options.stream,
-                tools: tools.length > 0 ? tools : undefined,
+                stream: false,
+                tools: options.stream ? [...tools, responseTool] : tools.length > 0 ? tools : undefined,
+                toolChoice: options.stream ? 'required' : undefined,
+                signal: options.signal,
             })
+            options.signal?.throwIfAborted()
             lastRaw = response
 
             const assistantMessage = response?.choices?.[0]?.message
@@ -445,14 +433,16 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
                     tool_calls: rawToolCalls,
                 })
 
-                const toolResults = await this.executeToolCalls(toolCalls)
+                const finishCalls = options.stream ? toolCalls.filter(call => call.name === 'begin_response') : []
+                const toolResults = await this.executeToolCalls(toolCalls.filter(call => !finishCalls.includes(call)))
+                for (const call of finishCalls) toolResults.push({ name: call.name, toolCallId: call.id, output: { ready: true } })
+                options.signal?.throwIfAborted()
 
                 for (const result of toolResults) {
-                    const toolContent =
-                        result.message ??
-                        (typeof result.output === 'string'
-                            ? result.output
-                            : JSON.stringify(result.output, null, 2))
+                    // The model needs the actual data, not just the UI summary.
+                    const toolContent = typeof result.output === 'string'
+                        ? result.output
+                        : JSON.stringify(result.output ?? { message: result.message ?? '' })
                     const toolCallId = result.toolCallId
 
                     this.history.push({
@@ -466,21 +456,36 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
                     if (result.memoryEntry) this.addMemory(result.memoryEntry)
                 }
 
-                if (content) finalContent = content
-
-                const isAllMemoryTools = toolCalls.every(tc => MEMORY_TOOL_NAMES.has(tc.name))
-                if (content && isAllMemoryTools) break
-                if (content) break
-
                 iterations += 1
+                if (finishCalls.length) break
                 continue
             }
 
+            if (options.stream) break // A provider ignoring tool_choice must not leak its planning prose.
             if (content) {
                 this.history.push({ role: 'assistant', content })
                 finalContent = content
             }
             break
+        }
+
+        if (options.stream) {
+            options.signal?.throwIfAborted()
+            const response = await this.client.sendChat(this.buildMessagesForAPI(systemPrompt +
+                '\n现在只输出面向伙伴的最终回答。首个短语自然简短；不要输出工具操作或内部思考。'), {
+                model: this.model, stream: true, signal: options.signal,
+            })
+            finalContent = await consumeChatStream(response, options.onDelta, options.signal)
+            lastRaw = undefined // Do not retain a consumed stream and its network resources.
+            if (finalContent) this.history.push({ role: 'assistant', content: finalContent })
+        }
+
+        // Exhausting the tool budget (or an empty model response) must still
+        // end the turn with a visible answer, never a tool preamble or silence.
+        if (!finalContent) {
+            finalContent = '抱歉，刚才没能把这件事处理好。我们再试一次，好吗？'
+            this.history.push({ role: 'assistant', content: finalContent })
+            if (options.stream) options.onDelta?.(finalContent)
         }
 
         // Fire-and-forget reflection. Errors in here must not affect the user.
@@ -505,7 +510,7 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
         return { content: finalContent, raw: lastRaw }
     }
 
-    private async executeToolCalls(toolCalls: ToolCallRequest[]) {
+    private async executeToolCalls(toolCalls: ToolCallRequest[]): Promise<ToolResult[]> {
         const executions = toolCalls.map(async toolCall => {
             const toolCallId = toolCall.id ?? this.generateToolCallId(toolCall.name)
             const tool = this.toolRegistry.get(toolCall.name)

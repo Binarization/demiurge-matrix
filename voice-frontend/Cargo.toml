@@ -1,0 +1,23 @@
+[package]
+name = "cyrene-voice-frontend"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+jieba-rs = "0.8.1"
+pinyin = { version = "0.10", features = ["compat", "plain", "with_tone", "with_tone_num", "with_tone_num_end"] }
+once_cell = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+tokenizers = { version = "0.22.1", default-features = false, features = ["unstable_wasm"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -60,3 +60,8 @@ Desktop.ini
 *.zip
 *.tar
 *.gz
+
+# Local voice models and Rust build outputs
+public/voice/
+voice-frontend/target/
+src/lib/voice/wasm/

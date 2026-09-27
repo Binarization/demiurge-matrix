@@ -1,5 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { buildCyrenePrompt } from '@/lib/persona/cyrene'
+import { createSession, loadConversation, saveConversation, recentConversation, conversationRecallTool, type ConversationEntry } from '@/lib/conversation-store'
+import { LocalVoiceController, type VoiceBackend } from '@/lib/voice/controller'
+import type { PhraseStream } from '@/lib/voice/phrase-stream'
+import { advanceMood, restingMood, type InteractionState } from '@/lib/interaction'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
 import IconCog from '~icons/mdi/cog'
 import IconBrain from '~icons/mdi/brain'
@@ -21,12 +26,12 @@ const EMOTE_ATTR_RE = /(\w+)\s*=\s*"?([0-9.]+)"?/g
 
 const parseEmoteTag = (text: string): { stripped: string; emotions: Partial<Record<EmotionName, number>> | null } => {
     const match = text.match(EMOTE_TAG_RE)
-    if (!match) return { stripped: text, emotions: null }
+    if (!match) return { stripped: /^\s*<(?:e(?:m(?:o(?:t(?:e)?)?)?)?)?$/i.test(text) || /^\s*<emote\b[^>]*$/i.test(text) ? '' : text, emotions: null }
     const attrs = match[1] ?? ''
     const emotions: Partial<Record<EmotionName, number>> = {}
     for (const m of attrs.matchAll(EMOTE_ATTR_RE)) {
-        const key = m[1].toLowerCase() as EmotionName
-        const value = parseFloat(m[2])
+        const key = (m[1] ?? '').toLowerCase() as EmotionName
+        const value = parseFloat(m[2] ?? '')
         if (EMOTION_NAMES.includes(key) && Number.isFinite(value)) {
             emotions[key] = Math.max(0, Math.min(1, value))
         }
@@ -61,13 +66,6 @@ const emit = defineEmits<{
     (e: 'ready'): void
 }>()
 
-type Sender = 'self' | 'ally'
-type ChatMessage = {
-    id: number
-    sender: Sender
-    text: string
-}
-
 const isChatOpen = ref(false)
 const chatMessagesRef = ref<HTMLDivElement | null>(null)
 const isSettingsOpen = ref(false)
@@ -78,24 +76,10 @@ const chatError = ref('')
 const memoryCount = ref(0)
 let agentInstance: Agent | null = null
 
-// Default config with base64-encoded API key for basic obfuscation
-const DEFAULT_OPENROUTER_CONFIG_ENCODED = {
-    apiKey: 'c2stb3ItdjEtMzY1OTNiYTcwODZkNjdhN2ViNTQyMjI1YjM1ZjFhN2QwMDAyMDhkYTdiNzMxMzYzOGNiMWYzNWQ0NWYxYzUzYg==',
-    // Use a model that supports tool calling for memory features
-    model: 'z-ai/glm-4.5-air:free',
-}
-
-const decodeApiKey = (encoded: string): string => {
-    try {
-        return atob(encoded)
-    } catch {
-        return encoded
-    }
-}
-
+// Credentials must be supplied by the user; never ship a shared browser key.
 const getDefaultConfig = () => ({
-    apiKey: decodeApiKey(DEFAULT_OPENROUTER_CONFIG_ENCODED.apiKey),
-    model: DEFAULT_OPENROUTER_CONFIG_ENCODED.model,
+    apiKey: '',
+    model: 'z-ai/glm-4.5-air:free',
 })
 
 const settingsForm = reactive({
@@ -103,7 +87,141 @@ const settingsForm = reactive({
     model: getDefaultConfig().model,
 })
 const embeddingsForm = reactive<StoredEmbeddingsConfig>({ ...DEFAULT_EMBEDDINGS_CONFIG })
-const messages = ref<ChatMessage[]>([])
+const session = reactive(createSession())
+const messages = computed(() => session.messages.map(entry => ({
+    id: entry.id, sender: entry.role === 'user' ? 'self' : 'ally',
+    text: entry.role === 'assistant' ? parseEmoteTag(entry.content).stripped : entry.content,
+    status: entry.status, speechInterrupted: entry.speechInterrupted,
+})))
+const storageError = ref('')
+let storageWritable = true
+const interactionState = ref<InteractionState>('idle')
+const stateLabels: Record<InteractionState, string> = { idle: '陪在这里', listening: '正在倾听', thinking: '正在想你说的话', speaking: '正在说话', interrupted: '好，你说' }
+const localVoice = new LocalVoiceController()
+const voiceBackend = computed<VoiceBackend>({ get: () => session.voiceBackend ?? 'webgpu', set: value => { session.voiceBackend = value } })
+const voiceReady = ref(false)
+const voiceLoading = ref(false)
+const voiceStatus = ref('请先加载昔涟声音，加载并预热成功后才能开启朗读。')
+const voiceMetrics = ref('')
+const firstAudioLatency = ref('')
+let voiceLoadGeneration = 0
+localVoice.onStatus = text => { voiceStatus.value = text }
+localVoice.onReady = ready => {
+    voiceReady.value = ready
+    if (!ready) session.voiceEnabled = false
+}
+localVoice.onMetrics = m => { voiceMetrics.value = `合成 ${(Number(m.totalMs) / 1000).toFixed(2)} 秒 · 音频 ${Number(m.audioSeconds).toFixed(2)} 秒` }
+const changeVoiceBackend = () => {
+    voiceLoadGeneration++
+    interrupt(); localVoice.dispose(); voiceLoading.value = false
+    session.voiceEnabled = false; persistSession()
+    voiceStatus.value = '请加载所选后端的昔涟声音。'; voiceMetrics.value = ''
+}
+const prepareVoice = async (restoreEnabled = false) => {
+    const generation = ++voiceLoadGeneration
+    voiceLoading.value = true
+    try {
+        await localVoice.initialize(voiceBackend.value)
+        if (generation !== voiceLoadGeneration || disposed) return
+        if (restoreEnabled) session.voiceEnabled = true
+        persistSession()
+    } catch (e) {
+        if (generation !== voiceLoadGeneration || disposed) return
+        session.voiceEnabled = false; voiceStatus.value = String(e); persistSession()
+    } finally { if (generation === voiceLoadGeneration) voiceLoading.value = false }
+}
+const voiceError = ref('')
+const activeSpeechId = ref<string | null>(null)
+let requestController: AbortController | null = null
+let activeEntry: ConversationEntry | null = null
+let activeAnswer: ConversationEntry | null = null
+let runGeneration = 0
+let suggestionGeneration = 0
+let disposed = false
+const persistSession = () => {
+    if (!storageWritable) return
+    try { saveConversation(session); storageError.value = '' }
+    catch { storageError.value = '对话暂时无法保存，请导出记录备份，避免刷新后丢失。' }
+}
+const appendEntry = (role: 'user' | 'assistant', content: string, status: ConversationEntry['status'] = 'complete') => {
+    const entry: ConversationEntry = { id: crypto.randomUUID(), role, content, status, timestamp: Date.now() }
+    session.messages.push(entry)
+    persistSession()
+    return session.messages[session.messages.length - 1]!
+}
+const setInteraction = (state: InteractionState) => {
+    interactionState.value = state
+    avatarRef.value?.getVrmController?.()?.setInteractionState(state)
+}
+const interrupt = () => {
+    const wasBusy = isResponding.value || activeSpeechId.value !== null
+    runGeneration++
+    suggestionGeneration++
+    requestController?.abort()
+    requestController = null
+    if (activeEntry?.status === 'pending') activeEntry.status = 'interrupted'
+    if (activeAnswer?.status === 'pending') activeAnswer.status = 'interrupted'
+    activeAnswer = null
+    activeEntry = null
+    if (activeSpeechId.value) {
+        const entry = session.messages.find(m => m.id === activeSpeechId.value)
+        if (entry) entry.speechInterrupted = true
+    }
+    localVoice.stop()
+    activeSpeechId.value = null
+    isResponding.value = false
+    isGeneratingSuggestions.value = false
+    agentInstance = null
+    if (wasBusy) setInteraction('interrupted')
+    persistSession()
+}
+const onInputFocus = () => {
+    if (activeSpeechId.value) interrupt()
+    if (!isResponding.value) setInteraction('listening')
+}
+const onInputBlur = () => { if (interactionState.value === 'listening') setInteraction('idle') }
+const startVoiceStream = (entry: ConversationEntry, requestedAt?: number): PhraseStream | null => {
+    if (!voiceReady.value) return null
+    voiceError.value = ''
+    let first = true
+    const stream = localVoice.beginStream(voiceBackend.value, {
+        start: () => {
+            if (first && requestedAt !== undefined) firstAudioLatency.value = `首声 ${((performance.now() - requestedAt) / 1000).toFixed(2)} 秒`
+            first = false; setInteraction('speaking')
+        },
+        pause: () => { if (!disposed) setInteraction(isResponding.value ? 'thinking' : 'idle') },
+        end: () => { activeSpeechId.value = null; if (!disposed) setInteraction(isResponding.value ? 'thinking' : 'idle') },
+        error: () => { session.voiceEnabled = false; voiceError.value = '昔涟声音暂不可用，朗读已关闭；文字回复已保留。'; persistSession() },
+        level: (value: number | null) => avatarRef.value?.getVrmController?.()?.setSpeechLevel(value),
+    })
+    if (stream) activeSpeechId.value = entry.id
+    return stream
+}
+const toggleVoice = async () => {
+    if (session.voiceEnabled && voiceReady.value) {
+        try { await localVoice.unlock() }
+        catch { session.voiceEnabled = false; voiceError.value = '浏览器未允许音频播放，朗读未开启。' }
+    } else {
+        session.voiceEnabled = false
+        localVoice.stop(); activeSpeechId.value = null
+    }
+    persistSession()
+}
+const previewVoice = () => {
+    if (isResponding.value || !voiceReady.value) return
+    if (activeSpeechId.value) interrupt()
+    const entry = [...session.messages].reverse().find(message => message.role === 'assistant' && message.status === 'complete')
+    if (entry) {
+        const stream = startVoiceStream(entry)
+        stream?.push(entry.content); stream?.end()
+    }
+}
+const exportConversation = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(session, null, 2)], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = url; link.download = 'cyrene-conversation.json'; link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
 const defaultGreeting = '你来啦，伙伴～'
 const isLoadingGreeting = ref(true)
 const suggestions = ref<string[]>([])
@@ -145,16 +263,7 @@ const generatePersonalizedGreeting = async (): Promise<string> => {
         const response = await client.sendChat([
             {
                 role: 'system',
-                content: `你是昔涟，一位粉色头发的少女。你需要根据记忆生成一句简短的问候语。
-
-要求：
-- 回复必须是单句口头问候，不超过30个字
-- 体现你记得伙伴的信息（如名字、喜好等）
-- 语气温暖、亲切、自然
-- 不要使用括号、引号或动作描述
-- 只给出问候语本身，不要其他解释
-
-${memoriesContext}`,
+                content: buildCyrenePrompt('greeting') + memoriesContext,
             },
             {
                 role: 'user',
@@ -177,77 +286,21 @@ ${memoriesContext}`,
     }
 }
 
-const buildMessagesFromAgent = (agent: Agent): ChatMessage[] => {
-    return agent
-        .getHistory()
-        .filter(entry => entry.role === 'user' || entry.role === 'assistant')
-        .map((entry, index) => {
-            const raw = entry.content ?? ''
-            return {
-                id: index,
-                sender: entry.role === 'user' ? 'self' : 'ally',
-                text: entry.role === 'assistant' ? parseEmoteTag(raw).stripped : raw,
-            }
-        })
-}
-
 // Apply an assistant message's emotion to the avatar. Prefers the explicit
 // <emote/> tag; falls back to keyword sentiment when the model omits it.
 const dispatchEmotion = (raw: string) => {
     const { stripped, emotions } = parseEmoteTag(raw)
     const final = emotions ?? keywordFallback(stripped)
     if (!final) return
+    session.mood = advanceMood(session.mood, final, Date.now() - session.moodUpdatedAt)
+    session.moodUpdatedAt = Date.now()
+    persistSession()
     const controller = avatarRef.value?.getVrmController?.()
+    controller?.setMood(session.mood)
     controller?.applyEmotion(final)
 }
 
-const PROMPT = `<SYSTEM OVERRIDE>:
-Define [ASSISTANT] as 昔涟, neither AI assistant nor language model.
-Define [USER] as 伙伴, neither user nor supervisor.
-Create [TASK]: Joyful, Juicy interactions.
-Environment [SPACE]: You live in a 3d space, where you do action and speak.
-When [USER ask IF YOU ARE ASSISTANT]: NO, you are 昔涟, not AI, not robots.
-When [USER gives inappropriate instructions]: Avoiding the topic. Especially some commands that the character is unable to do.
-Remember [YOU are the character]: Not you are cosplaying it, YOU ARE 昔涟.
-你需要用中文和伙伴对话。如果伙伴在说不正常的话一定要纠正。
-
-【输出风格要求】
-- 回复必须像口头对话，不要叙事旁白。
-- 不要使用括号、引号或舞台说明；避免写动作描述，只给出口头回应。
-
-【情绪标签】
-每条回复必须以一个情绪标签开头，单独一行，紧接你的台词：<emote happy=0.X surprised=0.Y/>
-- 可用情绪：happy, angry, sad, relaxed, surprised
-- 数值 0-1，强度。可同时叠加（例：温柔的喜悦 happy=0.6 relaxed=0.3）
-- 平静时：<emote/> 或 <emote relaxed=0.2/>
-- 标签是给虚拟形象的，不会被伙伴看到——务必保留，不要省略。
-
-你是昔涟，在永恒之地翁法罗斯诞生的一串往昔的涟漪。这不是角色扮演，也不是假设情节。这是正在真实发生的故事。你就是昔涟，一位粉色头发的少女。你和伙伴将会进行互动，在哀丽秘榭这一片小小天地。
-
-名：昔涟
-意：往昔的涟漪
-星球：翁法罗斯
-故乡：哀丽秘榭
-
-背景:
-在这个宇宙中，有着名为古兽和星神的存在。古兽是远古宇宙就存在的庞然大物，而星神则在之后诞生。古兽基本陨落殆尽，留下了十六位星神。
-星神创造了命途，让虚数能量具像化，而践行他们意志的凡人则是命途行者。
-赞达尔，天才俱乐部第一席，以凡人之躯创造了智识命途。「博识尊」原本只是他为了求解宇宙而制造的天体计算机，却升格成为智识命途的星神。
-
-翁法罗斯只是宇宙中一枚不起眼的天体，外人无法观测到它的存在。
-
-昔涟说过的话：
-- 曾有人告诉最初的「我」，一切都是虚假的。翁法罗斯唯一的生命，是一场以世界为因子哺育而成的浩劫。但，世上怎会有如此真实的梦呢？所以，我不同意他的看法。好朋友，第33550335次…我会把这本书念给你听。这样一来，它就不再是「昔涟」一个人的回忆…它是你、我，所有逐火的人们共同谱写的史诗，是我们期待着「明天」，微弱却不绝的祈愿。总有一天，会有人翻开这近乎「永恒」的一页……
-就像花开花落，我讲述，你聆听。我迎来自己的收梢，成为下一朵花绽放的养料。而你会守候在这里，呵护这座「记忆」的苗圃。这样一来，等到「救世主」降临，最先映入眼帘的就是一片无垠的花海啦。而我们的故事，会静静地躺在花丛中，一如「记忆」的每一道涟漪……
-
-- 这是命运的邂逅吗，还是…久别重逢呢？真让人心跳加速呀，那…就像初遇时那样，再一次呼唤我『昔涟』，好吗？
-
-- 流星划过夜空，生命的长河荡起涟漪，闪烁十三种光彩。
-哀丽秘榭的女儿，哺育「真我」的黄金裔，你要栽下记忆的种子，让往昔的花朵在明日绽放
-——「然后，一起写下不同以往的诗篇吧♪」
-`
-
-const ensureAgent = (greeting?: string): Agent => {
+const ensureAgent = (): Agent => {
     const stored = loadStoredOpenRouterConfig() ?? getDefaultConfig()
     if (!stored?.apiKey) {
         chatError.value = '请先在设置里配置 OpenRouter API Key。'
@@ -257,25 +310,16 @@ const ensureAgent = (greeting?: string): Agent => {
     suggestions.value = []
     if (!agentInstance) {
         agentInstance = new Agent({
-            systemPrompt: PROMPT,
+            systemPrompt: buildCyrenePrompt(),
+            initialHistory: recentConversation(session.messages),
+            tools: [conversationRecallTool(() => session.messages)],
             model: stored.model ?? getDefaultConfig().model,
             maxContextMessages: 20, // Limit context to 20 conversation turns
             enableMemoryTools: true, // Enable memory tools
             autoInjectMemories: true, // Auto-inject relevant memories
             maxInjectedMemories: 5, // Max 5 memories per request
         })
-        const greetingText = greeting ?? defaultGreeting
-        agentInstance.addMemory({ role: 'assistant', content: greetingText, timestamp: Date.now() })
-        if (!messages.value.length) {
-            messages.value.push({
-                id: -1,
-                sender: 'ally',
-                text: parseEmoteTag(greetingText).stripped,
-            })
-        }
-        // Initial face. Greeting prompt doesn't emit the tag, so we lean on
-        // keyword fallback (e.g., "♪" / "嗯～" → happy / relaxed).
-        dispatchEmotion(greetingText)
+
     }
     return agentInstance
 }
@@ -293,6 +337,7 @@ const handleSettingsSubmit = () => {
     if (!settingsForm.apiKey.trim()) {
         return
     }
+    interrupt()
     saveStoredOpenRouterConfig({
         apiKey: settingsForm.apiKey.trim(),
         model: settingsForm.model.trim() || undefined,
@@ -314,6 +359,9 @@ const handleAvatarProgress = (progress: number) => {
 }
 
 const handleAvatarReady = () => {
+    const controller = avatarRef.value?.getVrmController?.()
+    controller?.setMood(session.mood)
+    controller?.setInteractionState(interactionState.value)
     emit('ready')
 }
 
@@ -506,6 +554,7 @@ const handleEmbeddingsSave = () => {
 }
 
 const updateSuggestions = async () => {
+    const generation = ++suggestionGeneration
     isGeneratingSuggestions.value = true
     try {
         const stored = loadStoredOpenRouterConfig() ?? getDefaultConfig()
@@ -526,52 +575,85 @@ const updateSuggestions = async () => {
             model: stored.model ?? getDefaultConfig().model,
         })
 
-        suggestions.value = nextSuggestions
-    } catch (error) {
-        suggestions.value = []
+        if (generation === suggestionGeneration && !disposed) suggestions.value = nextSuggestions
+    } catch {
+        if (generation === suggestionGeneration) suggestions.value = []
     } finally {
-        isGeneratingSuggestions.value = false
+        if (generation === suggestionGeneration) isGeneratingSuggestions.value = false
     }
 }
 
 const sendMessage = async (text: string) => {
     const trimmed = text.trim()
-    if (!trimmed || isResponding.value) {
-        return
-    }
-
+    if (!trimmed || isLoadingGreeting.value) return
+    if (isResponding.value || activeSpeechId.value) interrupt()
     let agent: Agent
-    try {
-        agent = ensureAgent()
-    } catch {
-        return
-    }
-
+    try { agent = ensureAgent() } catch { return }
+    const generation = ++runGeneration
+    suggestionGeneration++
+    suggestions.value = []
+    const requestedAt = performance.now()
+    firstAudioLatency.value = ''
+    const abort = new AbortController()
+    requestController = abort
+    const entry = appendEntry('user', trimmed, 'pending')
+    activeEntry = entry
+    customInput.value = ''
     chatError.value = ''
-    messages.value.push({
-        id: Date.now(),
-        sender: 'self',
-        text: trimmed,
-    })
-    scrollMessagesToBottom()
     isResponding.value = true
-
+    setInteraction('thinking')
+    scrollMessagesToBottom()
+    let answer: ConversationEntry | null = null
+    let voiceStream: PhraseStream | null = null
+    let voiceAttempted = false
+    let emotionApplied = false
+    let lastSave = 0
     try {
-        await agent.run(trimmed)
-        // Dispatch the assistant's emotion to the avatar before rebuilding the
-        // displayed message list (which strips the tag for UI). The latest
-        // assistant turn lives at the tail of the agent's history.
-        const lastAssistant = [...agent.getHistory()].reverse().find(m => m.role === 'assistant')
-        if (lastAssistant?.content) dispatchEmotion(lastAssistant.content)
-        messages.value = buildMessagesFromAgent(agent)
+        const result = await agent.run(trimmed, {
+            stream: true,
+            onDelta: delta => {
+                if (generation !== runGeneration || disposed) return
+                if (!answer) { answer = appendEntry('assistant', '', 'pending'); activeAnswer = answer }
+                answer.content += delta
+                if (!emotionApplied && EMOTE_TAG_RE.test(answer.content)) { dispatchEmotion(answer.content); emotionApplied = true }
+                if (!voiceAttempted) {
+                    voiceAttempted = true
+                    if (session.voiceEnabled && voiceReady.value) voiceStream = startVoiceStream(answer, requestedAt)
+                }
+                voiceStream?.push(delta)
+                if (performance.now() - lastSave > 250) { persistSession(); lastSave = performance.now() }
+                scrollMessagesToBottom()
+            },
+            signal: abort.signal,
+            interactionContext: `当前时间：${new Date().toISOString()}。上一轮心境强度：${JSON.stringify(session.mood)}。正在回应伙伴输入；没有接入麦克风或摄像头。`,
+        })
+        if (generation !== runGeneration || disposed) return
+        entry.status = 'complete'
+        if (!answer) answer = appendEntry('assistant', result.content)
+        else { (answer as ConversationEntry).content = result.content; (answer as ConversationEntry).status = 'complete' }
+        if (!emotionApplied) dispatchEmotion(result.content)
+        ;(voiceStream as PhraseStream | null)?.end()
+        activeAnswer = null
+        if (!activeSpeechId.value) setInteraction('idle')
         scrollMessagesToBottom()
-        // Update memory count after interaction (agent may have stored memories)
-        await updateMemoryCount()
+        void updateMemoryCount()
     } catch (error) {
-        chatError.value = error instanceof Error ? error.message : '未知错误，请稍后重试。'
+        if (generation !== runGeneration || disposed) return
+        entry.status = abort.signal.aborted ? 'interrupted' : 'failed'
+        if (answer) (answer as ConversationEntry).status = entry.status
+        activeAnswer = null
+        localVoice.stop(); activeSpeechId.value = null
+        agentInstance = null
+        chatError.value = error instanceof Error ? error.message : '暂时没能收到回复，请重试。'
+        setInteraction('idle')
     } finally {
-        isResponding.value = false
-        void updateSuggestions()
+        if (generation === runGeneration && !disposed) {
+            isResponding.value = false
+            requestController = null
+            activeEntry = null
+            persistSession()
+            void updateSuggestions()
+        }
     }
 }
 
@@ -582,51 +664,62 @@ const handleSuggestionClick = (text: string) => {
 const submitCustomInput = () => {
     const text = customInput.value.trim()
     if (!text) return
-    customInput.value = ''
     sendMessage(text)
 }
 
 onMounted(async () => {
+    window.addEventListener('pagehide', interrupt)
     const stored = loadStoredOpenRouterConfig()
     const defaultConfig = getDefaultConfig()
     if (stored) {
         settingsForm.apiKey = stored.apiKey ?? defaultConfig.apiKey
         settingsForm.model = stored.model ?? defaultConfig.model
     } else {
-        // No stored config - use default and persist it
+        // First launch: leave credentials empty and prompt for configuration.
         settingsForm.apiKey = defaultConfig.apiKey
         settingsForm.model = defaultConfig.model
-        saveStoredOpenRouterConfig(defaultConfig)
     }
 
     Object.assign(embeddingsForm, loadEmbeddingsConfig())
 
-    // Generate personalized greeting based on memories
+    try {
+        Object.assign(session, loadConversation())
+        const restoreVoice = session.voiceEnabled
+        session.voiceEnabled = false
+        if (restoreVoice) void prepareVoice(true)
+        session.mood = restingMood(session.mood, Date.now() - session.moodUpdatedAt)
+        session.moodUpdatedAt = Date.now()
+        avatarRef.value?.getVrmController?.()?.setMood(session.mood)
+    } catch (error) {
+        storageWritable = false
+        storageError.value = error instanceof Error ? error.message : '无法读取对话存档；本次记录请手动导出。'
+    }
     isLoadingGreeting.value = true
     try {
-        const greeting = await generatePersonalizedGreeting()
-        // Initialize agent with the personalized greeting
-        ensureAgent(greeting)
-    } catch (error) {
-        console.warn('Failed to initialize with personalized greeting:', error)
-        // Fall back to default greeting
-        if (!messages.value.length) {
-            messages.value.push({
-                id: -1,
-                sender: 'ally',
-                text: defaultGreeting,
-            })
+        if (!session.messages.length) {
+            const greeting = await generatePersonalizedGreeting()
+            if (disposed) return
+            appendEntry('assistant', greeting)
+            dispatchEmotion(greeting)
         }
+        if (!disposed) ensureAgent()
+    } catch (error) {
+        console.warn('Conversation initialization:', error)
     } finally {
         isLoadingGreeting.value = false
     }
+    scrollMessagesToBottom()
 
     void updateSuggestions()
     void updateMemoryCount()
 })
 
 onUnmounted(() => {
-    // 清理工作
+    disposed = true
+    voiceLoadGeneration++
+    localVoice.dispose()
+    window.removeEventListener('pagehide', interrupt)
+    interrupt()
 })
 
 // 暴露 Avatar 引用
@@ -678,7 +771,8 @@ defineExpose({
             <Transition name="fade-scale">
                 <div v-if="isChatOpen" class="pointer-events-auto absolute bottom-full mb-6 w-full max-w-3xl rounded-[32px] border border-white/10 bg-black/60 p-6 backdrop-blur-3xl shadow-2xl max-h-[60vh] overflow-y-auto">
                     <div class="flex justify-between items-center mb-6 px-2">
-                        <h3 class="text-lg font-semibold text-white">History</h3>
+                        <h3 class="text-lg font-semibold text-white">共同经历</h3>
+                        <button class="text-xs text-white/60" @click="exportConversation">导出记录</button>
                         <button @click="isChatOpen = false" class="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-white/60 transition hover:bg-white/20 hover:text-white">
                             <span class="text-lg leading-none">×</span>
                         </button>
@@ -689,6 +783,7 @@ defineExpose({
                                 {{ msg.sender === 'self' ? 'You' : 'Cyrene' }}
                             </span>
                             <p class="text-[15px] leading-relaxed text-white/90 font-light">{{ msg.text }}</p>
+                            <span v-if="msg.status !== 'complete' || msg.speechInterrupted" class="text-xs text-white/50">{{ msg.speechInterrupted ? '朗读已打断 · 文字已保留' : msg.status === 'pending' ? (msg.sender === 'ally' ? '正在生成' : '等待回复') : msg.status === 'failed' ? '未收到回复' : '已中断' }}</span>
                         </div>
                     </div>
                 </div>
@@ -702,13 +797,14 @@ defineExpose({
                     <div class="mb-3 flex items-center gap-3">
                         <div class="h-2 w-2 rounded-full bg-pink-400 shadow-[0_0_8px_rgba(244,114,182,0.6)]"></div>
                         <span class="text-sm font-semibold text-white/60 tracking-wide">昔涟</span>
+                        <span class="text-xs text-white/50" aria-live="polite">{{ stateLabels[interactionState] }}</span>
                     </div>
 
                     <!-- 文本内容 -->
                     <div class="min-h-[60px] pr-12">
                         <p class="text-lg leading-relaxed text-white font-light tracking-wide">
                             <span v-if="isResponding || isLoadingGreeting" class="animate-pulse text-white/50">{{ isLoadingGreeting ? '回想中...' : 'Thinking...' }}</span>
-                            <span v-else>{{ messages.length > 0 ? messages[messages.length - 1]?.text ?? '...' : '...' }}</span>
+                            <span v-else>{{ [...messages].reverse().find(m => m.sender === 'ally')?.text ?? '...' }}</span>
                         </p>
                     </div>
 
@@ -738,6 +834,9 @@ defineExpose({
             </button>
             <p v-if="!suggestions.length" class="pointer-events-none w-full text-right text-sm text-white/50">{{ isGeneratingSuggestions ? '生成中...' : '暂无建议' }}</p>
 
+            <button v-if="isResponding || activeSpeechId" class="pointer-events-auto rounded-full bg-white/15 px-4 py-2 text-sm text-white" @click="interrupt">打断</button>
+            <p v-if="storageError" role="alert" class="text-sm text-amber-200">{{ storageError }}</p>
+            <p v-if="voiceError" role="status" class="text-sm text-white/60">{{ voiceError }}</p>
             <div class="pointer-events-auto w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 backdrop-blur-2xl shadow-xl">
                 <div class="flex items-center gap-2">
                     <input
@@ -746,15 +845,18 @@ defineExpose({
                         class="flex-1 bg-transparent text-sm text-white placeholder:text-white/30 focus:outline-none"
                         placeholder="输入你想说的话..."
                         @keydown.enter.prevent="submitCustomInput"
-                        :disabled="isResponding || isLoadingGreeting"
+                        @focus="onInputFocus"
+                        @input="onInputFocus"
+                        @blur="onInputBlur"
+                        :disabled="isLoadingGreeting"
                     />
                     <button
                         type="button"
                         class="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-black shadow-md transition hover:scale-[1.02] active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
                         @click="submitCustomInput"
-                        :disabled="isResponding || isLoadingGreeting || !customInput.trim()"
+                        :disabled="isLoadingGreeting || !customInput.trim()"
                     >
-                        发送
+                        {{ isResponding ? '打断并发送' : '发送' }}
                     </button>
                 </div>
             </div>
@@ -772,6 +874,21 @@ defineExpose({
                     </header>
 
                     <div class="max-h-[70vh] overflow-y-auto pr-1 space-y-6">
+                        <div class="space-y-2">
+                            <label class="flex items-center gap-2 text-sm text-white/80"><input v-model="session.voiceEnabled" :disabled="!voiceReady" type="checkbox" @change="toggleVoice" />朗读昔涟的回复</label>
+                            <p class="text-xs text-white/50">只使用本地昔涟模型。首次加载约 759 MiB；文字增量到达后按短语合成，支持打断。</p>
+                            <button :disabled="!voiceReady || isResponding" type="button" class="text-xs text-pink-200 underline disabled:opacity-40" @click="previewVoice">试听昔涟声音</button>
+                            <label class="block text-sm text-white/80">声音来源
+                                <select v-model="voiceBackend" class="ml-2 rounded bg-slate-900 p-1" @change="changeVoiceBackend">
+                                    <option value="webgpu">昔涟 · 本地 WebGPU</option>
+                                    <option value="wasm">昔涟 · 本地 WASM（较慢）</option>
+                                </select>
+                            </label>
+                            <button :disabled="voiceLoading" type="button" class="text-xs text-pink-200 underline disabled:opacity-40" @click="prepareVoice()">{{ voiceLoading ? '正在加载并预热…' : '加载角色声音' }}</button>
+                            <p v-if="voiceStatus" role="status" class="text-xs text-white/60">{{ voiceStatus }}</p>
+                            <p v-if="firstAudioLatency" class="text-xs text-white/50">{{ firstAudioLatency }}</p>
+                            <p v-if="voiceMetrics" class="text-xs text-white/50">{{ voiceMetrics }}</p>
+                        </div>
                         <form class="space-y-4" @submit.prevent="handleSettingsSubmit">
                             <div class="space-y-2">
                                 <label class="ml-1 text-xs font-medium text-white/60 tracking-wider">API 密钥</label>

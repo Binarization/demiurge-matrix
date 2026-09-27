@@ -7,6 +7,14 @@ export type StoredOpenRouterConfig = {
 
 const isBrowser = () => typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'
 
+// Fingerprint only, used to remove the shared credential persisted by older
+// releases. This is a migration identifier, not a security/validation hash.
+const isLegacySharedKey = (key: string): boolean => {
+    let hash = 2166136261
+    for (const char of key) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619)
+    return key.length === 73 && (hash >>> 0) === 2331280947
+}
+
 export const loadStoredOpenRouterConfig = (): StoredOpenRouterConfig | null => {
     if (!isBrowser()) {
         return null
@@ -17,7 +25,12 @@ export const loadStoredOpenRouterConfig = (): StoredOpenRouterConfig | null => {
     }
     try {
         const parsed = JSON.parse(raw) as StoredOpenRouterConfig
-        return parsed && typeof parsed.apiKey === 'string' ? parsed : null
+        if (!parsed || typeof parsed.apiKey !== 'string') return null
+        if (isLegacySharedKey(parsed.apiKey)) {
+            window.localStorage.removeItem(OPENROUTER_STORAGE_KEY)
+            return null
+        }
+        return parsed
     } catch (error) {
         console.warn('Failed to parse OpenRouter config from storage', error)
         return null

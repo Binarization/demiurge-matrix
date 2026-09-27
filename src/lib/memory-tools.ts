@@ -17,7 +17,7 @@ import {
     type MemorySubject,
     type StoredMemory,
 } from './memory-store'
-import { embed, isEmbeddingsAvailable } from './embeddings'
+import { embed, cosineSimilarity, isEmbeddingsAvailable } from './embeddings'
 import { hybridSearch, findSimilarByEmbedding } from './memory-search'
 
 const VALID_CATEGORIES: MemoryCategory[] = ['fact', 'preference', 'event', 'correction', 'context']
@@ -196,13 +196,13 @@ const performStoreWithDedup = async (a: StoreMemoryArgs): Promise<ToolResult> =>
                 }
             }
 
-            // Near-duplicate (no contradiction) — bump importance/confidence and skip.
-            // Always check lexical overlap too, even when vector matched, so vector
-            // false-positives across unrelated content don't collapse into a near-dup.
+            // Lexical candidates haven't necessarily passed the vector threshold.
+            // Check the actual similarity before discarding the new information.
             const lexicalOverlap = sharedNgramRatio(content, existing.content)
             const hasEmbedding = !!existing.embedding && existing.embedding.length > 0
             const isNearDup = embedding && hasEmbedding
-                ? true // already passed cosine ≥ 0.82
+                ? existing.embedding!.length === embedding.length &&
+                    cosineSimilarity(embedding, existing.embedding!) >= 0.82
                 : lexicalOverlap > 0.65
 
             if (isNearDup) {
@@ -365,7 +365,7 @@ export const forgetMemoryTool: Tool = {
 - 伙伴明确要求忘记`,
 
     execute: async (args: unknown): Promise<ToolResult> => {
-        const { memoryId, reason } = args as ForgetMemoryArgs
+        const { memoryId } = args as ForgetMemoryArgs
         if (!memoryId) {
             return {
                 name: 'forget_memory',
@@ -384,15 +384,8 @@ export const forgetMemoryTool: Tool = {
             }
             // Soft delete — invalidate so it stays out of retrieval
             await memoryStore.update(memoryId, { isValid: 0 })
-            if (reason) {
-                await enqueueStoreMemory({
-                    content: `[已遗忘] ${memory.content} - 原因: ${reason}`,
-                    category: 'correction',
-                    importance: 3,
-                    source: 'agent_reflection',
-                    metadata: { originalMemoryId: memoryId },
-                })
-            }
+            // The invalidated record is the audit trail. Never copy forgotten
+            // content back into a live correction memory.
             return {
                 name: 'forget_memory',
                 output: { success: true, memoryId, forgotten: memory.content.slice(0, 50) },

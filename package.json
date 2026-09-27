@@ -7,8 +7,16 @@
         "dev": "vite",
         "dev:host": "vite --host",
         "build": "vite build",
+        "test": "bun test",
         "preview": "vite preview",
-        "format": "prettier --write \"src/**/*.{js,ts,vue,css,scss,json}\" \"*.{js,ts,json,md}\""
+        "format": "prettier --write \"src/**/*.{js,ts,vue,css,scss,json}\" \"*.{js,ts,json,md}\"",
+        "voice:prepare": "node scripts/prepare-voice.mjs",
+        "voice:build": "wasm-pack build voice-frontend --target web --out-dir ../src/lib/voice/wasm --release",
+        "voice:check": "node scripts/check-voice-frontend.mjs",
+        "voice:test-browser": "node scripts/check-voice-browser.mjs",
+        "predev": "node scripts/check-voice-build.mjs",
+        "prebuild": "node scripts/check-voice-build.mjs",
+        "voice:test-streaming": "node scripts/check-streaming-browser.mjs"
     },
     "dependencies": {
         "@iconify-json/mdi": "^1.2.3",
@@ -17,6 +25,7 @@
         "@pixiv/three-vrm-animation": "^3.4.4",
         "@tailwindcss/vite": "^4.1.17",
         "flexsearch": "^0.8.212",
+        "onnxruntime-web": "1.24.3",
         "tailwindcss": "^4.1.17",
         "three": "^0.181.1",
         "unplugin-icons": "^22.5.0",
@@ -29,6 +38,7 @@
         "@types/three": "^0.181.0",
         "@vitejs/plugin-vue": "^6.0.1",
         "@vue/tsconfig": "^0.8.1",
+        "playwright": "1.63.0",
         "prettier": "^3.6.2",
         "typescript": "~5.9.3",
         "vite": "^7.2.2",

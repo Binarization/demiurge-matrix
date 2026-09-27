@@ -1,0 +1,16 @@
+{
+  "source": "sbv2-onnx-server",
+  "revision": "e119059ed8f5a71417b11963d1d99cc6d646fa81",
+  "note": "Copied from the local working tree; hashes describe copied files, including removal of native bert module declaration.",
+  "sha256": {
+    "src/nlp/mod.rs": "ba4deb67e1e9b38e6325e75348c8846d29cd9aaf603a18696564b2025dd4b344",
+    "src/nlp/english/mod.rs": "ba4e627b974fad2c93bf337c001edac67e6c09f64ca4dfb460d2ec97dec68156",
+    "src/nlp/chinese/cn2an.rs": "52f5e480452a435f9e87ec59386e459832625a5bdc2c72d138b4b95f6c4b646b",
+    "src/nlp/chinese/mod.rs": "a2eec867bb559a50bf68356a0a902f259b00f40c5c60df6367efdc9d6a1c8812",
+    "src/nlp/chinese/g2p.rs": "7a0501a078649ef59faeda233bbc55cc60065713647f491f405547e41729cae0",
+    "src/nlp/chinese/normalizer.rs": "dde56da29a17c2ba97f0a1c2069c84cd934c0a80fd77430ee64213facb47abb2",
+    "src/nlp/chinese/tone_sandhi.rs": "983611d1b4d66a5b4bc7f2e4c12cff0692356307fb0de3dcd4e85d0613ec011c",
+    "resources/cmudict.rep": "d127b5ce8b8e695732701e8efde04b9b0fa11991218b1fb9d21bd0c9264636aa",
+    "resources/opencpop-strict.txt": "d66bbb1380a8ebf17d7ace5bf4b459f3728a469eea2aaeae2aeb3969b88223ff"
+  }
+}

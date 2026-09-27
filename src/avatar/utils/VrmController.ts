@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { emptyMood, type Mood, type InteractionState } from '@/lib/interaction'
 import { VRM } from '@pixiv/three-vrm'
 import {
     createVRMAnimationClip,
@@ -46,6 +47,13 @@ export class VrmController {
     private _emotionLastSetAt: number = 0
     private _emotionSmoothing: number = 8.0
     private _emotionDecayWindow: number = 4.0
+    private _mood: Mood = emptyMood()
+    private _interactionState: InteractionState = 'idle'
+    private _interactionStartedAt = 0
+    private _headOffset = new THREE.Quaternion()
+    private _headNode: THREE.Object3D | null = null
+    private _posePitch = 0
+    private _poseRoll = 0
 
     // Generic per-expression tween. Lets callers ramp any expression smoothly
     // (e.g. mouth shapes for visemes, custom expressions). Each tween is
@@ -434,6 +442,10 @@ export class VrmController {
         // (philia/等待.vrma writes sad + blink + oh every frame). The mixer
         // must run first; auto-blink + emotion + tweens + neutral all run
         // after so their writes are the ones the renderer sees.
+        // Remove our previous additive pose before sampling the animation,
+        // including clips that don't key the head on every frame.
+        if (this._headNode) this._headNode.quaternion.multiply(this._headOffset.clone().invert())
+        this._headOffset.identity()
         this._animationMixer.update(delta)
 
         if (this._autoBlinkEnabled) {
@@ -441,6 +453,7 @@ export class VrmController {
         }
         this._updateEmotions(delta)
         this._updateExpressionTweens(delta)
+        this._updateInteraction(delta)
         this._updateBlendShapeNeutral()
 
         this._vrm.update(delta)
@@ -725,6 +738,41 @@ export class VrmController {
         this._emotionLastSetAt = performance.now()
     }
 
+    setMood(mood: Mood) { this._mood = { ...mood } }
+
+    setInteractionState(state: InteractionState) {
+        if (this._interactionState === state) return
+        this._interactionState = state
+        this._interactionStartedAt = performance.now()
+    }
+
+    private _speechLevel: number | null = null
+    setSpeechLevel(value: number | null) { this._speechLevel = value === null ? null : Math.max(0, Math.min(1, value)) }
+
+
+    private _updateInteraction(delta: number) {
+        if (!this._vrm) return
+        const elapsed = (performance.now() - this._interactionStartedAt) / 1000
+        const fade = Math.min(1, elapsed * 3)
+        const state = this._interactionState
+        const pitch = state === 'speaking' ? Math.sin(elapsed * 3) * 0.025
+            : state === 'interrupted' ? -0.035 * Math.exp(-elapsed * 2) : 0
+        const roll = state === 'listening' ? 0.045 : state === 'thinking' ? -0.06 : 0
+        this._headNode = this._vrm.humanoid?.getNormalizedBoneNode('head') ?? null
+        const blend = 1 - Math.exp(-Math.max(0, delta) * 6)
+        this._posePitch += (pitch * fade - this._posePitch) * blend
+        this._poseRoll += (roll * fade - this._poseRoll) * blend
+        this._headOffset.setFromEuler(new THREE.Euler(this._posePitch, 0, this._poseRoll))
+        this._headNode?.quaternion.multiply(this._headOffset)
+        const expressions = this._vrm.expressionManager
+        if (!expressions) return
+        // Mouth opening follows actual PCM energy; silence stays closed.
+        const opening = state === 'speaking' ? (this._speechLevel ?? 0) : 0
+        for (const name of ['aa', 'ih', 'ou', 'ee', 'oh']) {
+            if (expressions.expressionMap[name]) expressions.setValue(name, name === 'aa' ? opening : 0)
+        }
+    }
+
     /**
      * Configure emotion tween responsiveness and how long after the last
      * applyEmotion() before the face decays back to neutral.
@@ -738,18 +786,16 @@ export class VrmController {
         if (!this._vrm || !this._vrm.expressionManager) return
         const expressionManager = this._vrm.expressionManager
 
-        // Auto-decay: after the idle window, ramp targets back to 0.
-        if (this._emotionLastSetAt > 0) {
-            const sinceLast = (performance.now() - this._emotionLastSetAt) / 1000
-            if (sinceLast > this._emotionDecayWindow) {
-                for (const name of EMOTION_NAMES) this._emotionTargets[name] = 0
-            }
-        }
+        // A short expression relaxes into the persistent mood, not a blank face.
+        const sinceLast = (performance.now() - this._emotionLastSetAt) / 1000
+        const hold = this._emotionLastSetAt === 0 ? 0 : this._interactionState === 'speaking' ? 1
+            : Math.exp(-Math.max(0, sinceLast - this._emotionDecayWindow) / 12)
 
         // Tween current → target with a frame-rate-independent smoothing factor.
         const k = 1 - Math.exp(-this._emotionSmoothing * delta)
         for (const name of EMOTION_NAMES) {
-            const next = this._emotionCurrent[name] + (this._emotionTargets[name] - this._emotionCurrent[name]) * k
+            const target = this._emotionTargets[name] * hold + this._mood[name] * (1 - hold)
+            const next = this._emotionCurrent[name] + (target - this._emotionCurrent[name]) * k
             this._emotionCurrent[name] = next
             // Only write if the model actually has the preset, to avoid spurious warnings.
             if (expressionManager.expressionMap[name]) {
