@@ -16,7 +16,9 @@
         "voice:test-browser": "node scripts/check-voice-browser.mjs",
         "predev": "node scripts/check-voice-build.mjs",
         "prebuild": "node scripts/check-voice-build.mjs",
-        "voice:test-streaming": "node scripts/check-streaming-browser.mjs"
+        "voice:test-streaming": "node scripts/check-streaming-browser.mjs",
+        "test:ui": "node scripts/check-companion-ui.mjs",
+        "test:speech-input": "node scripts/check-speech-input-browser.mjs"
     },
     "dependencies": {
         "@iconify-json/mdi": "^1.2.3",

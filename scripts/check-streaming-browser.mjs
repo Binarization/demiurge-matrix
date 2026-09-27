@@ -173,15 +173,14 @@ try {
     assert.equal(await toggle.isEnabled(), false)
     assert.equal(await page.getByLabel('声音来源').locator('option').count(), 2)
     await page.getByRole('button', { name: '加载角色声音' }).click()
-    await page
-        .getByText('角色声音已就绪（WebGPU / WASM）', { exact: true })
-        .waitFor({ timeout: 180000 })
+    await page.getByText('声音已准备好', { exact: true }).waitFor({ timeout: 180000 })
     assert.equal(await toggle.isEnabled(), true)
     await toggle.check()
-    await page.getByRole('button', { name: '×', exact: true }).click()
+    await page.getByRole('button', { name: '关闭偏好', exact: true }).click()
     await page.getByPlaceholder('输入你想说的话...').fill('讲一句话给我听')
     await page.getByRole('button', { name: '发送', exact: true }).click()
     await page.waitForFunction(() => window.__voiceTest.sounds > 0, {}, { timeout: 120000 })
+    assert.match(await page.getByRole('region', { name: '昔涟的回复' }).innerText(), /你好，伙伴。/)
     assert.equal(
         await page.evaluate(() => window.__voiceTest.llmDone),
         false,
@@ -227,11 +226,16 @@ try {
         route.fulfill({ status: 404, body: 'missing' })
     )
     await unavailable.goto(process.env.VOICE_TEST_URL ?? 'http://127.0.0.1:5175/')
-    await unavailable.getByLabel('声音来源').waitFor({ timeout: 60000 })
+    await unavailable.getByRole('button', { name: '打开设置' }).click({ timeout: 60000 })
+    await unavailable.getByText('兼容性与加载状态', { exact: true }).click()
     const disabledToggle = unavailable.getByLabel('朗读昔涟的回复')
     assert.equal(await disabledToggle.isEnabled(), false)
     await unavailable.getByRole('button', { name: '加载角色声音' }).click()
-    await unavailable.getByText(/未找到本地声音模型/).waitFor()
+    await unavailable
+        .getByRole('dialog')
+        .getByText(/未找到本地声音模型/)
+        .first()
+        .waitFor()
     assert.equal(await disabledToggle.isEnabled(), false)
     assert.equal(await disabledToggle.isChecked(), false)
     await unavailable.close()

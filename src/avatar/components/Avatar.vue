@@ -1121,6 +1121,14 @@ const animateCameraZoom = (): Promise<void> => {
         const targetPosition = { ...cameraAnimationConfig.value.endPosition }
         const targetRotation = { ...cameraAnimationConfig.value.endRotation }
 
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            camera.position.set(targetPosition.x, targetPosition.y, targetPosition.z)
+            camera.rotation.set(targetRotation.x, targetRotation.y, targetRotation.z)
+            needUpdateBackground = true
+            resolve()
+            return
+        }
+
         // 设置初始位置和旋转
         camera.position.set(startPosition.x, startPosition.y, startPosition.z)
         camera.rotation.set(startRotation.x, startRotation.y, startRotation.z)
