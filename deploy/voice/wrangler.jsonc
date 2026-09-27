@@ -1,0 +1,10 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "demiurge-cyrene-voice",
+  "main": "worker.ts",
+  "account_id": "dd5a578632dcc3be9e4c1162d6d08090",
+  "compatibility_date": "2026-09-27",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "r2_buckets": [{ "binding": "VOICE", "bucket_name": "demiurge-cyrene-voice" }]
+}

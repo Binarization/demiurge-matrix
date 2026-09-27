@@ -6,12 +6,12 @@
     "scripts": {
         "dev": "vite",
         "dev:host": "vite --host",
-        "build": "vite build",
+        "build": "vite build && node scripts/check-pages-assets.mjs",
         "test": "bun test",
         "preview": "vite preview",
         "format": "prettier --write \"src/**/*.{js,ts,vue,css,scss,json}\" \"*.{js,ts,json,md}\"",
         "voice:prepare": "node scripts/prepare-voice.mjs",
-        "voice:build": "wasm-pack build voice-frontend --target web --out-dir ../src/lib/voice/wasm --release",
+        "voice:build": "wasm-pack build voice-frontend --target web --out-dir ../src/lib/voice/wasm --release && node scripts/sync-voice-runtime.mjs",
         "voice:check": "node scripts/check-voice-frontend.mjs",
         "voice:test-browser": "node scripts/check-voice-browser.mjs",
         "predev": "node scripts/check-voice-build.mjs",
@@ -44,6 +44,7 @@
         "prettier": "^3.6.2",
         "typescript": "~5.9.3",
         "vite": "^7.2.2",
-        "vue-tsc": "^3.1.3"
+        "vue-tsc": "^3.1.3",
+        "wrangler": "^4.141.0"
     }
 }

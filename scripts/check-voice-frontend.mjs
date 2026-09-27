@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
-import init, { Frontend } from '../src/lib/voice/wasm/cyrene_voice_frontend.js'
+import init, { Frontend } from '../src/lib/voice/runtime/cyrene_voice_frontend.js'
 const manifest = JSON.parse(
     await readFile(new URL('../public/voice/manifest.json', import.meta.url))
 )
@@ -10,7 +10,7 @@ const tokenizer = await readFile(
 )
 await init({
     module_or_path: await readFile(
-        new URL('../src/lib/voice/wasm/cyrene_voice_frontend_bg.wasm', import.meta.url)
+        new URL('../src/lib/voice/runtime/cyrene_voice_frontend_bg.wasm', import.meta.url)
     ),
 })
 const frontend = new Frontend(tokenizer)

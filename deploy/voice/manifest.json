@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "files": {
+    "model": {
+      "url": "model-b0a5fdeb5d36b579.onnx",
+      "sha256": "b0a5fdeb5d36b579a298caa4443f9ecae25ba11f4ec13d36cc8ead7b56274149"
+    },
+    "bert": {
+      "url": "bert-1c5623c67e8456d2.onnx",
+      "sha256": "1c5623c67e8456d2bc0268397c373273ac25919be6259d14bc8eca3faa74ba7c"
+    },
+    "tokenizer": {
+      "url": "tokenizer-b9a5d82ccce844a8.json",
+      "sha256": "b9a5d82ccce844a850a31c00db93b95f65c66fc622ac3f625dd03154dd23d373"
+    },
+    "style": {
+      "url": "style-b850fbfc9eea6f42.npy",
+      "sha256": "b850fbfc9eea6f4210b4824b5dd39ef81072114c0bd89b3215cefc64add8cad0"
+    },
+    "config": {
+      "url": "config-5785dab9d753f785.json",
+      "sha256": "5785dab9d753f785481f533708ed2badf9da00720f32b46ebf4636bf40537c55"
+    }
+  }
+}

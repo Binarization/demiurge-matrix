@@ -173,7 +173,28 @@ try {
     assert.equal(await toggle.isEnabled(), false)
     assert.equal(await page.getByLabel('声音来源').locator('option').count(), 2)
     await page.getByRole('button', { name: '加载角色声音' }).click()
-    await page.getByText('声音已准备好', { exact: true }).waitFor({ timeout: 180000 })
+    const loadProgress = setInterval(async () => {
+        const text = await page
+            .locator('.preference-details [role="status"]')
+            .first()
+            .textContent()
+            .catch(() => '')
+        console.log('Voice loading:', text)
+    }, 30000)
+    try {
+        await page.waitForFunction(
+            () => {
+                const status =
+                    document.querySelector('.preference-details [role="status"]')?.textContent ?? ''
+                if (/Error:|TypeError:/.test(status)) throw new Error(status)
+                return document.querySelector('.ready-note')?.textContent === '声音已准备好'
+            },
+            {},
+            { timeout: 600000 }
+        )
+    } finally {
+        clearInterval(loadProgress)
+    }
     assert.equal(await toggle.isEnabled(), true)
     await toggle.check()
     await page.getByRole('button', { name: '关闭偏好', exact: true }).click()
@@ -223,7 +244,11 @@ try {
     assert.deepEqual(errors, [])
     const unavailable = await browser.newPage()
     await unavailable.route('**/voice/manifest.json', route =>
-        route.fulfill({ status: 404, body: 'missing' })
+        route.fulfill({
+            status: 404,
+            body: 'missing',
+            headers: { 'Access-Control-Allow-Origin': '*' },
+        })
     )
     await unavailable.goto(process.env.VOICE_TEST_URL ?? 'http://127.0.0.1:5175/')
     await unavailable.getByRole('button', { name: '打开设置' }).click({ timeout: 60000 })

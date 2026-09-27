@@ -1,0 +1,92 @@
+[
+  {
+    "path": "model-b0a5fdeb5d36b579.onnx",
+    "size": 196745136,
+    "parts": [
+      {
+        "key": "part-5293cf3c74a167cce5ddbeb04a02127c606c3ff11028e95fb5daaf85406c9caa.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-ebda2f974349738362fafe5d04c664dd37af1185c49fd6a887a34553aacd7a7f.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-10c4e85bc38afbac6c0aa70d71d130befdb0489163898ec1d12dfdb865d8478e.bin",
+        "size": 62527408
+      }
+    ]
+  },
+  {
+    "path": "bert-1c5623c67e8456d2.onnx",
+    "size": 599034176,
+    "parts": [
+      {
+        "key": "part-7b9167ab535c68c36a63409e5f3631035338611186239a285b5a58bcc56848b9.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-f2b225f8f92bd8f81549bf1381a2e6869f5e13b15d679e4bdf46a37590575ffe.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-189b25e57773d6efe9afc1887aefbcda893b5b4a5405c0dbd36ccbe43cdc69cc.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-b1a3239a46ec32bf23c3e71578caee7cf9f9a08b41914e403995203ce608ab5f.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-c701eaa814c32435638586e8efa4b3e01e34b79eda73178cf96912e49d4ac4e4.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-94f85ff1354003e311ad3933105bc2eb0b429c488bc55b070649604b8a5ea9ea.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-282ee65ab8ba9fd9fda028cb7b0d06e669f7705cf81a78acae604d06a9baf3cf.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-8352cd648048e529f2eda7b0e6e3616381dfb063e4af46cb8c0372856cccaed8.bin",
+        "size": 67108864
+      },
+      {
+        "key": "part-caf433b0c1fe93fd2f7050cc10a4eba1449e2cc11b31d17c241c14c2d05110c2.bin",
+        "size": 62163264
+      }
+    ]
+  },
+  {
+    "path": "tokenizer-b9a5d82ccce844a8.json",
+    "size": 438228,
+    "parts": [
+      {
+        "key": "part-b9a5d82ccce844a850a31c00db93b95f65c66fc622ac3f625dd03154dd23d373.bin",
+        "size": 438228
+      }
+    ]
+  },
+  {
+    "path": "style-b850fbfc9eea6f42.npy",
+    "size": 1152,
+    "parts": [
+      {
+        "key": "part-b850fbfc9eea6f4210b4824b5dd39ef81072114c0bd89b3215cefc64add8cad0.bin",
+        "size": 1152
+      }
+    ]
+  },
+  {
+    "path": "config-5785dab9d753f785.json",
+    "size": 2135,
+    "parts": [
+      {
+        "key": "part-5785dab9d753f785481f533708ed2badf9da00720f32b46ebf4636bf40537c55.bin",
+        "size": 2135
+      }
+    ]
+  }
+]

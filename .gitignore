@@ -65,3 +65,7 @@ Desktop.ini
 public/voice/
 voice-frontend/target/
 src/lib/voice/wasm/
+
+src/lib/voice/generated/
+
+.wrangler/

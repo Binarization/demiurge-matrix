@@ -1,4 +1,5 @@
 import { PhraseStream } from './phrase-stream'
+import hosting from './hosting.json'
 export type VoiceBackend = 'webgpu' | 'wasm'
 export interface VoiceCallbacks {
     start: () => void
@@ -82,7 +83,11 @@ export class LocalVoiceController {
             }
         }
         this.ready = this.request('init', {
-            base: new URL(`${import.meta.env.BASE_URL}voice/`, location.href).href,
+            base: new URL(
+                import.meta.env.VITE_VOICE_BASE_URL ||
+                    (import.meta.env.PROD ? hosting.baseUrl : `${import.meta.env.BASE_URL}voice/`),
+                location.href
+            ).href,
             mode,
         }).then(reply => {
             if (this.worker !== worker) throw new Error('声音加载已取消')

@@ -8,6 +8,22 @@ import wasm from 'vite-plugin-wasm'
 export default defineConfig({
     plugins: [
         wasm(),
+        {
+            name: 'omit-overridden-ort-wasm',
+            apply: 'build',
+            generateBundle(_options, bundle) {
+                // ORT's fallback URL causes Vite to emit this even though the voice
+                // Worker supplies wasmBinary from our compressed runtime instead.
+                for (const [name, entry] of Object.entries(bundle)) {
+                    if (
+                        entry.type === 'asset' &&
+                        /^assets\/ort-wasm-simd-threaded\.asyncify-[\w-]+\.wasm$/.test(name)
+                    ) {
+                        delete bundle[name]
+                    }
+                }
+            },
+        },
         vue(),
         tailwindcss(),
         Icons({

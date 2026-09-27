@@ -1,12 +1,12 @@
 import * as ort from 'onnxruntime-web/webgpu'
-import ortWasm from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url'
+import ortWasmGzip from './generated/ort-runtime.gzip.bin?url'
 import ortModule from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs?url'
-import init, { Frontend } from './wasm/cyrene_voice_frontend'
+import init, { Frontend } from './runtime/cyrene_voice_frontend'
 import { expandBert, normalizePcm, readStyle, type Prepared } from './data'
 
 ort.env.wasm.numThreads = 1
 ort.env.wasm.proxy = false
-ort.env.wasm.wasmPaths = { wasm: ortWasm, mjs: ortModule }
+ort.env.wasm.wasmPaths = { mjs: ortModule }
 let bert: ort.InferenceSession | undefined, model: ort.InferenceSession | undefined
 let frontend: Frontend, style: Float32Array
 let initializing: Promise<void> | undefined
@@ -65,6 +65,11 @@ async function load(base: string, mode: 'webgpu' | 'wasm') {
         executionProviders: mode === 'webgpu' ? ['webgpu', 'wasm'] : ['wasm'],
         graphOptimizationLevel: 'all',
     }
+    const runtimeResponse = await fetch(ortWasmGzip)
+    if (!runtimeResponse.ok || !runtimeResponse.body) throw new Error('语音运行时加载失败')
+    ort.env.wasm.wasmBinary = await new Response(
+        runtimeResponse.body.pipeThrough(new DecompressionStream('gzip'))
+    ).arrayBuffer()
     status('正在初始化中文 BERT…')
     bert = await ort.InferenceSession.create(await asset('bert'), options)
     if (mode === 'webgpu' && !ort.env.webgpu.device)
