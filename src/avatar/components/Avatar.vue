@@ -22,6 +22,9 @@ import { VRMAnimationLoaderPlugin } from '@pixiv/three-vrm-animation'
 import { VRMLookAtSmootherLoaderPlugin } from '@/avatar/libs/VRMLookAtSmootherLoaderPlugin/VRMLookAtSmootherLoaderPlugin'
 import type { VRMLookAtSmoother } from '@/avatar/libs/VRMLookAtSmootherLoaderPlugin/VRMLookAtSmoother'
 import { Preloader, PreloadResource, PreloaderEvent } from '@/avatar/utils/Preloader'
+import { BodyDirector, type BodyAction, type SceneEvent } from '@/avatar/scene/BodyDirector'
+import { CameraDirector, type CameraView } from '@/avatar/scene/CameraDirector'
+import { createStageGeometry, disposeStage, FLOOR_Y, HOME, SEAT } from '@/avatar/scene/layout'
 import { VrmController } from '@/avatar/utils/VrmController'
 // @ts-ignore - GaussianSplats3D doesn't have type definitions
 import * as GaussianSplats3D from '@/avatar/libs/GaussianSplats3D'
@@ -127,6 +130,7 @@ interface Emits {
     (e: 'vrmLoaded', vrm: any): void
     (e: 'splatLoaded'): void
     (e: 'ready'): void
+    (e: 'interaction', event: SceneEvent): void
 }
 
 const emit = defineEmits<Emits>()
@@ -163,6 +167,12 @@ let renderer: any = null
 let camera: THREE.PerspectiveCamera | null = null
 let controls: OrbitControls | null = null
 let skysphere: THREE.Mesh | null = null
+let stageGeometry: THREE.Group | null = null
+let bodyDirector: BodyDirector | null = null
+let cameraDirector: CameraDirector | null = null
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
+let pointerContact: { id: number; region: 'head' | 'hand' | 'body'; x: number; y: number; travel: number; controlsEnabled: boolean } | null = null
+let lastContactAt = 0
 let isPaused = false // 是否暂停渲染
 
 // Cursor-driven lookAt. cursorTarget rides a virtual plane in front of the
@@ -318,6 +328,29 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
             (vrmRotation.value.z * Math.PI) / 180
         )
         vrmModel.scene.scale.setScalar(vrmScale.value)
+
+        bodyDirector = new BodyDirector(modelVrm, event => {
+            if (cameraDirector && bodyDirector) {
+                if (event.phase === 'start' && ['approach', 'return', 'sit', 'stand', 'stretch'].includes(event.action)) {
+                    const origin = bodyDirector.position
+                    if (event.action === 'sit') origin.x = (origin.x + SEAT.x) / 2
+                    cameraDirector.beginAction(origin, reducedMotion())
+                } else if (event.phase !== 'start') {
+                    const origin = bodyDirector.position
+                    if (bodyDirector.seated) origin.y -= 0.38
+                    cameraDirector.endAction(origin, reducedMotion())
+                }
+            }
+            if (event.phase === 'start') {
+                vrmController.cancelGestures()
+                if (event.action === 'headpat') vrmController.applyEmotion({ relaxed: 0.5, happy: 0.2 })
+                if (event.action === 'wave' || event.action === 'offer_hand') vrmController.applyEmotion({ happy: 0.35 })
+            }
+            emit('interaction', event)
+        })
+        vrmController.bodyDirector = bodyDirector
+        stageGeometry = createStageGeometry(new URLSearchParams(location.search).has('scene-debug'))
+        vrmScene?.add(stageGeometry)
 
         // 注册并播放动画
         vrmController.registerVRMAnimation('idle', idleAnimation)
@@ -598,9 +631,11 @@ function animate() {
         }
 
         // 更新控制器（动画期间跳过，避免控制器干扰相机位置）
-        if (controls && !isCameraAnimating) {
+        if (controls && !isCameraAnimating && !cameraDirector?.active) {
             controls.update()
         }
+
+        if (!isCameraAnimating) cameraDirector?.update(delta)
 
         // 检测相机是否移动
         hasCameraMoved()
@@ -637,6 +672,12 @@ function animate() {
         if (vrmController.hasVRM()) {
             vrmController.update(delta)
             updateVRMTransform()
+            if (vrmModel) {
+                cursorLookPlane.constant = -(vrmModel.scene.position.z + 1)
+                const contact = stageGeometry?.getObjectByName('foot-contact')
+                if (contact) contact.position.set(vrmModel.scene.position.x, FLOOR_Y + 0.006,
+                    bodyDirector?.seated ? SEAT.z + 0.485 : vrmModel.scene.position.z + 0.06)
+            }
         }
 
         // 渲染 VRM 场景（包含背景纹理平面）
@@ -681,6 +722,10 @@ function onWindowResize() {
  * The smoother takes it from there.
  */
 function onPointerMove(event: PointerEvent) {
+    if (pointerContact && event.pointerId === pointerContact.id) {
+        pointerContact.travel += Math.hypot(event.clientX - pointerContact.x, event.clientY - pointerContact.y)
+        pointerContact.x = event.clientX; pointerContact.y = event.clientY
+    }
     if (!camera || !cursorTarget) return
     cursorNDC.x = (event.clientX / window.innerWidth) * 2 - 1
     cursorNDC.y = -(event.clientY / window.innerHeight) * 2 + 1
@@ -706,11 +751,71 @@ function reattachCursorTarget() {
     }
 }
 
+
+function onManualCamera() { cameraDirector?.manual() }
+function hitRegion(event: PointerEvent): 'head' | 'hand' | 'body' | null {
+    if (!camera || !vrmModel || !canvas.value) return null
+    const rect = canvas.value.getBoundingClientRect()
+    const ray = new THREE.Raycaster()
+    ray.setFromCamera(new THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
+        -(event.clientY - rect.top) / rect.height * 2 + 1), camera)
+    // Separate hit volumes follow the actual rig; hair/cape meshes cannot steal hand taps.
+    const targets = [
+        { bone: 'head', radius: 0.16, region: 'head', up: 0.08 },
+        { bone: 'leftHand', radius: 0.10, region: 'hand', up: 0 },
+        { bone: 'rightHand', radius: 0.10, region: 'hand', up: 0 },
+        { bone: 'chest', radius: 0.22, region: 'body', up: -0.05 },
+    ] as const
+    for (const target of targets) {
+        const bone = vrmModel.humanoid.getNormalizedBoneNode(target.bone)
+        if (!bone) continue
+        const center = bone.getWorldPosition(new THREE.Vector3()); center.y += target.up
+        if (ray.ray.intersectsSphere(new THREE.Sphere(center, target.radius))) return target.region
+    }
+    return null
+}
+function onContactStart(event: PointerEvent) {
+    if (!event.isPrimary) { cancelContact(); return }
+    if (event.button !== 0 || isCameraAnimating || isPaused || bodyDirector?.busy) return
+    const region = hitRegion(event)
+    if (!region) return
+    pointerContact = { id: event.pointerId, region, x: event.clientX, y: event.clientY, travel: 0, controlsEnabled: controls?.enabled ?? false }
+    if (controls) controls.enabled = false
+    canvas.value?.setPointerCapture(event.pointerId)
+    event.stopImmediatePropagation()
+}
+function cancelContact() {
+    if (pointerContact && controls) controls.enabled = pointerContact.controlsEnabled
+    if (pointerContact && canvas.value?.hasPointerCapture(pointerContact.id)) canvas.value.releasePointerCapture(pointerContact.id)
+    pointerContact = null
+}
+function onContactEnd(event: PointerEvent) {
+    const contact = pointerContact
+    if (!contact || event.pointerId !== contact.id) return
+    cancelContact()
+    event.stopImmediatePropagation()
+    if (performance.now() - lastContactAt < 1800) return
+    if (contact.region !== 'head' && contact.travel > 15) return
+    const action = contact.region === 'head' ? 'headpat' : contact.region === 'hand' ? 'offer_hand' : 'wave'
+    if (playBodyAction(action)) lastContactAt = performance.now()
+}
+function playBodyAction(action: BodyAction) { return bodyDirector?.play(action) ?? false }
+function setCameraView(view: CameraView) {
+    if (!bodyDirector || isCameraAnimating) return
+    const origin = bodyDirector.position
+    if (bodyDirector.seated) origin.y -= 0.38
+    cameraDirector?.select(view, origin, reducedMotion())
+}
+function stopBodyAction() { bodyDirector?.cancel(); vrmController.cancelGestures() }
+
 /**
  * 页面可见性变化处理
  */
 function onVisibilityChange() {
     if (document.hidden) {
+        cancelContact()
+        stopBodyAction()
+        cameraDirector?.manual()
         isPaused = true
     } else {
         // 页面回到前台，恢复渲染
@@ -955,11 +1060,19 @@ onMounted(async () => {
             controls.maxAzimuthAngle = props.maxAzimuthAngle
 
             // 缩放限制
-            controls.minDistance = props.minDistance
-            controls.maxDistance = props.maxDistance
+            controls.minDistance = Math.min(props.minDistance, 1.5)
+            controls.maxDistance = Math.max(props.maxDistance, 8)
 
             controls.update()
         }
+
+        if (camera && controls) {
+            cameraDirector = new CameraDirector(camera, controls)
+            controls.addEventListener('start', onManualCamera)
+        }
+        canvas.value?.addEventListener('pointerdown', onContactStart, true)
+        canvas.value?.addEventListener('pointerup', onContactEnd, true)
+        canvas.value?.addEventListener('pointercancel', cancelContact, true)
 
         // 7. 预先导入VRM相关模块并注册插件（必须在 preloader.load() 之前）
         const { VRMLoaderPlugin } = await import('@pixiv/three-vrm')
@@ -1033,6 +1146,16 @@ onUnmounted(() => {
     window.removeEventListener('pointercancel', releaseCursorTarget)
     window.removeEventListener('pointerenter', reattachCursorTarget)
     cursorTarget = null
+
+    canvas.value?.removeEventListener('pointerdown', onContactStart, true)
+    canvas.value?.removeEventListener('pointerup', onContactEnd, true)
+    canvas.value?.removeEventListener('pointercancel', cancelContact, true)
+    cancelContact()
+    controls?.removeEventListener('start', onManualCamera)
+    cameraDirector = null
+    if (stageGeometry) disposeStage(stageGeometry)
+    stageGeometry = null
+    bodyDirector = null
 
     // 清理 Preloader Worker
     if (preloader) {
@@ -1204,6 +1327,11 @@ const animateCameraZoom = (): Promise<void> => {
 
 // 暴露给父组件的方法
 defineExpose({
+    playBodyAction,
+    setCameraView,
+    stopBodyAction,
+    getSceneState: () => ({ action: bodyDirector?.currentAction, seated: bodyDirector?.seated ?? false,
+        position: bodyDirector?.position.toArray(), floor: FLOOR_Y, home: HOME.toArray(), cameraView: cameraDirector?.view }),
     getVrmController: () => vrmController,
     getVrmModel: () => vrmModel,
     getCamera: () => camera,

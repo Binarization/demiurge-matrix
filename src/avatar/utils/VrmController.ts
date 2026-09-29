@@ -1,4 +1,6 @@
 import * as THREE from 'three'
+import type { BodyDirector } from '../scene/BodyDirector'
+import { CompanionMotion, type Gesture } from './CompanionMotion'
 import { emptyMood, type Mood, type InteractionState } from '@/lib/interaction'
 import { VRM } from '@pixiv/three-vrm'
 import {
@@ -49,11 +51,9 @@ export class VrmController {
     private _emotionDecayWindow: number = 4.0
     private _mood: Mood = emptyMood()
     private _interactionState: InteractionState = 'idle'
-    private _interactionStartedAt = 0
-    private _headOffset = new THREE.Quaternion()
-    private _headNode: THREE.Object3D | null = null
-    private _posePitch = 0
-    private _poseRoll = 0
+    private _motion = new CompanionMotion()
+    bodyDirector: BodyDirector | null = null
+    private _reducedMotion = typeof matchMedia !== 'undefined' ? matchMedia('(prefers-reduced-motion: reduce)') : null
 
     // Generic per-expression tween. Lets callers ramp any expression smoothly
     // (e.g. mouth shapes for visemes, custom expressions). Each tween is
@@ -189,6 +189,9 @@ export class VrmController {
      */
     clearVRM() {
         this._detachActionListeners()
+        this._motion.reset()
+        this.bodyDirector?.dispose()
+        this.bodyDirector = null
         this._vrm = null
         this._activeActionName = null
         this._animationMixer = null
@@ -444,9 +447,10 @@ export class VrmController {
         // after so their writes are the ones the renderer sees.
         // Remove our previous additive pose before sampling the animation,
         // including clips that don't key the head on every frame.
-        if (this._headNode) this._headNode.quaternion.multiply(this._headOffset.clone().invert())
-        this._headOffset.identity()
+        this._motion.restore()
+        this.bodyDirector?.restore()
         this._animationMixer.update(delta)
+        this.bodyDirector?.update(delta)
 
         if (this._autoBlinkEnabled) {
             this._updateAutoBlink(delta)
@@ -743,8 +747,15 @@ export class VrmController {
     setInteractionState(state: InteractionState) {
         if (this._interactionState === state) return
         this._interactionState = state
-        this._interactionStartedAt = performance.now()
+        if (state === 'speaking') this._motion.startSpeech()
+        if (state === 'interrupted' || state === 'listening') this._motion.cancel()
+        if (state === 'interrupted') this.bodyDirector?.cancel()
     }
+
+    queueGesture(gesture: Gesture, waitForAudio = false) {
+        this._motion.request(gesture, waitForAudio && this._interactionState !== 'speaking')
+    }
+    cancelGestures() { this._motion.cancel() }
 
     private _speechLevel: number | null = null
     setSpeechLevel(value: number | null) { this._speechLevel = value === null ? null : Math.max(0, Math.min(1, value)) }
@@ -752,18 +763,10 @@ export class VrmController {
 
     private _updateInteraction(delta: number) {
         if (!this._vrm) return
-        const elapsed = (performance.now() - this._interactionStartedAt) / 1000
-        const fade = Math.min(1, elapsed * 3)
         const state = this._interactionState
-        const pitch = state === 'speaking' ? Math.sin(elapsed * 3) * 0.025
-            : state === 'interrupted' ? -0.035 * Math.exp(-elapsed * 2) : 0
-        const roll = state === 'listening' ? 0.045 : state === 'thinking' ? -0.06 : 0
-        this._headNode = this._vrm.humanoid?.getNormalizedBoneNode('head') ?? null
-        const blend = 1 - Math.exp(-Math.max(0, delta) * 6)
-        this._posePitch += (pitch * fade - this._posePitch) * blend
-        this._poseRoll += (roll * fade - this._poseRoll) * blend
-        this._headOffset.setFromEuler(new THREE.Euler(this._posePitch, 0, this._poseRoll))
-        this._headNode?.quaternion.multiply(this._headOffset)
+        this._motion.update(delta, state, this._speechLevel ?? 0,
+            name => this._vrm?.humanoid.getNormalizedBoneNode(name) ?? null,
+            (this._reducedMotion?.matches ?? false) || (this.bodyDirector?.ownsPose ?? false))
         const expressions = this._vrm.expressionManager
         if (!expressions) return
         // Mouth opening follows actual PCM energy; silence stays closed.

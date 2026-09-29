@@ -33,6 +33,10 @@ import {
     DEFAULT_EMBEDDINGS_CONFIG,
     type StoredEmbeddingsConfig,
 } from '@/lib/embeddings-config'
+import { ACTION_LABELS, type BodyAction, type SceneEvent } from '@/avatar/scene/BodyDirector'
+import type { CameraView } from '@/avatar/scene/CameraDirector'
+import { parseSceneCue } from '@/avatar/scene/commands'
+import { parseGesture } from '@/avatar/utils/CompanionMotion'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
 import { EMOTION_NAMES, type EmotionName } from '@/avatar/utils/VrmController'
@@ -281,8 +285,11 @@ const setInteraction = (state: InteractionState) => {
     avatarRef.value?.getVrmController?.()?.setInteractionState(state)
 }
 const interrupt = () => {
+    pendingSceneCue = null
+    avatarRef.value?.stopBodyAction()
     speechInput.cancel()
     const wasBusy = isResponding.value || activeSpeechId.value !== null
+    avatarRef.value?.getVrmController?.()?.cancelGestures()
     runGeneration++
     suggestionGeneration++
     requestController?.abort()
@@ -320,15 +327,20 @@ const startVoiceStream = (entry: ConversationEntry, requestedAt?: number): Phras
                 firstAudioLatency.value = `首声 ${((performance.now() - requestedAt) / 1000).toFixed(2)} 秒`
             first = false
             setInteraction('speaking')
+            flushSceneCue()
         },
         pause: () => {
             if (!disposed) setInteraction(isResponding.value ? 'thinking' : 'idle')
         },
         end: () => {
+            pendingSceneCue = null
+            avatarRef.value?.getVrmController?.()?.cancelGestures()
             activeSpeechId.value = null
             if (!disposed) setInteraction(isResponding.value ? 'thinking' : 'idle')
         },
         error: () => {
+            pendingSceneCue = null
+            avatarRef.value?.getVrmController?.()?.cancelGestures()
             session.voiceEnabled = false
             voiceError.value = '昔涟声音暂不可用，朗读已关闭；文字回复已保留。'
             persistSession()
@@ -502,12 +514,19 @@ const generatePersonalizedGreeting = async (): Promise<string> => {
 // <emote/> tag; falls back to keyword sentiment when the model omits it.
 const dispatchEmotion = (raw: string) => {
     const { stripped, emotions } = parseEmoteTag(raw)
+    const controller = avatarRef.value?.getVrmController?.()
+    const cue = parseSceneCue(raw)
+    if (cue.body || cue.camera) {
+        pendingSceneCue = cue
+        if (!session.voiceEnabled || !voiceReady.value || interactionState.value === 'speaking') flushSceneCue()
+    }
+    const gesture = parseGesture(raw)
+    if (gesture && !cue.body) controller?.queueGesture(gesture, session.voiceEnabled && voiceReady.value)
     const final = emotions ?? keywordFallback(stripped)
     if (!final) return
     session.mood = advanceMood(session.mood, final, Date.now() - session.moodUpdatedAt)
     session.moodUpdatedAt = Date.now()
     persistSession()
-    const controller = avatarRef.value?.getVrmController?.()
     controller?.setMood(session.mood)
     controller?.applyEmotion(final)
 }
@@ -565,6 +584,42 @@ const handleSettingsSubmit = () => {
 
 // Avatar ref
 const avatarRef = ref<InstanceType<typeof Avatar> | null>(null)
+const scenePanelOpen = ref(false)
+const sceneBusy = ref(false)
+const sceneSeated = ref(false)
+const sceneNotice = ref('')
+let sceneNoticeTimer: ReturnType<typeof setTimeout> | undefined
+let pendingSceneCue: ReturnType<typeof parseSceneCue> | null = null
+const noticeScene = (text: string) => {
+    sceneNotice.value = text
+    clearTimeout(sceneNoticeTimer)
+    sceneNoticeTimer = setTimeout(() => { sceneNotice.value = '' }, 3600)
+}
+const handleSceneEvent = (event: SceneEvent) => {
+    sceneBusy.value = event.phase === 'start'
+    sceneSeated.value = avatarRef.value?.getSceneState().seated ?? false
+    if (event.phase !== 'start') {
+        session.sceneEvents ??= []
+        session.sceneEvents.push({ timestamp: Date.now(), action: event.label, outcome: event.phase })
+        session.sceneEvents = session.sceneEvents.slice(-20)
+        persistSession()
+    }
+    noticeScene(event.phase === 'start' ? event.label : event.phase === 'cancel' ? '动作停下来了' : `${event.label} · 已完成`)
+}
+const requestBodyAction = (action: BodyAction) => {
+    scenePanelOpen.value = false
+    if (!avatarRef.value?.playBodyAction(action)) noticeScene(sceneSeated.value ? '先站起来，再走动吧。' : '稍等这个动作结束，再试一次。')
+}
+const requestCameraView = (view: CameraView) => {
+    avatarRef.value?.setCameraView(view)
+    scenePanelOpen.value = false
+}
+const flushSceneCue = () => {
+    const cue = pendingSceneCue; pendingSceneCue = null
+    if (cue?.body) requestBodyAction(cue.body)
+    if (cue?.camera) avatarRef.value?.setCameraView(cue.camera)
+}
+onUnmounted(() => clearTimeout(sceneNoticeTimer))
 
 // 处理 Avatar 加载进度
 const handleAvatarProgress = (progress: number) => {
@@ -873,7 +928,7 @@ const sendMessage = async (text: string) => {
                 scrollMessagesToBottom()
             },
             signal: abort.signal,
-            interactionContext: `当前时间：${new Date().toISOString()}。上一轮心境强度：${JSON.stringify(session.mood)}。正在回应伙伴输入；没有接入麦克风或摄像头。`,
+            interactionContext: `当前时间：${new Date().toISOString()}。上一轮心境强度：${JSON.stringify(session.mood)}。当前场景状态：${JSON.stringify(avatarRef.value?.getSceneState())}。最近实际场景互动：${JSON.stringify(session.sceneEvents?.slice(-6) ?? [])}。没有接入摄像头；用户消息可能来自键盘或用户确认发送的语音转写。`,
         })
         if (generation !== runGeneration || disposed) return
         entry.status = 'complete'
@@ -890,6 +945,8 @@ const sendMessage = async (text: string) => {
         void updateMemoryCount()
     } catch (error) {
         if (generation !== runGeneration || disposed) return
+        pendingSceneCue = null
+        avatarRef.value?.getVrmController?.()?.cancelGestures()
         entry.status = abort.signal.aborted ? 'interrupted' : 'failed'
         if (answer) (answer as ConversationEntry).status = entry.status
         activeAnswer = null
@@ -992,6 +1049,7 @@ defineExpose({
                 :show-loading-progress="false"
                 @loading="handleAvatarProgress"
                 @ready="handleAvatarReady"
+                @interaction="handleSceneEvent"
             />
         </div>
         <div class="scene-shade" aria-hidden="true"></div>
@@ -1007,6 +1065,9 @@ defineExpose({
                 ><span>昔涟</span><small>与你，此刻</small>
             </div>
             <nav class="presence-actions" aria-label="陪伴选项">
+                <button class="ambient-button" @click="scenePanelOpen = true" aria-label="打开互动">
+                    <span aria-hidden="true">✧</span><span>一起</span>
+                </button>
                 <button class="ambient-button" @click="openHistory" aria-label="打开共同经历">
                     <IconChatProcessingOutline /><span>回忆</span>
                 </button>
@@ -1016,6 +1077,10 @@ defineExpose({
             </nav>
         </header>
 
+        <div v-if="sceneNotice || sceneBusy" class="scene-feedback" role="status">
+            <span>{{ sceneNotice }}</span>
+            <button v-if="sceneBusy" class="text-button" @click="avatarRef?.stopBodyAction()" aria-label="停止动作">停一下</button>
+        </div>
         <main v-show="!quietMode" class="companion-dock" aria-label="与昔涟对话">
             <section class="reply-caption" aria-label="昔涟的回复">
                 <div class="caption-byline">
@@ -1204,6 +1269,24 @@ defineExpose({
             </div>
         </div>
 
+        <CompanionSheet :open="scenePanelOpen" title="一起待一会儿" subtitle="轻触她的头或手，也会有回应。" @close="scenePanelOpen = false">
+            <div class="scene-options">
+                <p>换个距离</p>
+                <div class="scene-choice-row">
+                    <button class="soft-button" @click="requestCameraView('companion')">陪伴视角</button>
+                    <button class="soft-button" @click="requestCameraView('full')">看看全身</button>
+                    <button class="soft-button" @click="requestCameraView('close')">近一点看</button>
+                </div>
+                <p>此刻，做点什么</p>
+                <div class="scene-action-grid">
+                    <button v-for="action in (['approach', 'return', 'stretch', 'wave', 'offer_hand', 'headpat', 'sit', 'stand'] as const)"
+                        :key="action" class="soft-button"
+                        :disabled="sceneBusy || (action === 'stand' && !sceneSeated) || (sceneSeated && ['approach', 'return', 'stretch', 'sit'].includes(action))"
+                        @click="requestBodyAction(action)">{{ ACTION_LABELS[action] }}</button>
+                </div>
+                <p class="scene-hint">在她头上轻轻划过，可以摸摸头。拖动空白处可以转动视角；手动调整时，镜头会听你的。</p>
+            </div>
+        </CompanionSheet>
         <CompanionSheet
             :open="isChatOpen"
             title="共同经历"
@@ -1712,6 +1795,13 @@ defineExpose({
 </template>
 
 <style scoped>
+.scene-feedback { position: fixed; z-index: 21; top: 85px; right: 36px; display: flex; align-items: center; gap: 14px; color: #eee7ec; font-size: 12px; text-shadow: 0 1px 8px #24212e; }
+.scene-options { display: grid; gap: 18px; padding: 6px 0; }
+.scene-options > p { color: var(--muted, #aca3b8); font-size: 12px; }
+.scene-choice-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.scene-action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.scene-hint { line-height: 1.9; }
+@media (max-width: 600px) { .scene-feedback { right: 20px; top: 78px; } }
 .core-root {
     --ink: #24212e;
     --dusk: #3a3448;

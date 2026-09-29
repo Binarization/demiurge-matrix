@@ -18,6 +18,7 @@ export type ConversationSession = {
     moodUpdatedAt: number
     voiceEnabled: boolean
     voiceBackend?: 'webgpu' | 'wasm'
+    sceneEvents?: Array<{ timestamp: number; action: string; outcome: 'complete' | 'cancel' }>
 }
 export const createSession = (): ConversationSession => ({ version: 1, messages: [], mood: emptyMood(), moodUpdatedAt: Date.now(), voiceEnabled: false })
 export function loadConversation(storage: Pick<Storage, 'getItem'> = window.localStorage): ConversationSession {
@@ -33,7 +34,7 @@ export function loadConversation(storage: Pick<Storage, 'getItem'> = window.loca
             status: entry.status === 'pending' ? 'interrupted' : entry.status,
             speechInterrupted: entry.speechInterrupted === true }
     })
-    return { version: 1, messages, mood: normalizeMood(data.mood),
+    return { version: 1, messages, sceneEvents: Array.isArray(data.sceneEvents) ? data.sceneEvents.filter((event: any) => Number.isFinite(event?.timestamp) && typeof event.action === 'string' && ['complete', 'cancel'].includes(event.outcome)).slice(-20) : [], mood: normalizeMood(data.mood),
         moodUpdatedAt: Number.isFinite(data.moodUpdatedAt) ? data.moodUpdatedAt : Date.now(), voiceEnabled: data.voiceEnabled === true && ['webgpu', 'wasm'].includes(data.voiceBackend),
         voiceBackend: data.voiceBackend === 'wasm' ? 'wasm' : 'webgpu' }
 }

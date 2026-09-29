@@ -64,3 +64,13 @@ test('legacy device voice cannot remain enabled after migration', () => {
     expect(session.voiceEnabled).toBe(false)
     expect(session.voiceBackend).toBe('webgpu')
 })
+
+test('actual scene outcomes persist and invalid imported events are omitted', () => {
+    const db = storage()
+    const session = createSession()
+    session.sceneEvents = [{ timestamp: 10, action: '坐一会儿', outcome: 'complete' }, { timestamp: 11, action: '伸个懒腰', outcome: 'cancel' }]
+    saveConversation(session, db)
+    expect(loadConversation(db).sceneEvents).toEqual(session.sceneEvents)
+    db.setItem(CONVERSATION_KEY, JSON.stringify({ ...session, sceneEvents: [null, { timestamp: 'bad', action: '动作', outcome: 'complete' }, ...session.sceneEvents] }))
+    expect(loadConversation(db).sceneEvents).toHaveLength(2)
+})
