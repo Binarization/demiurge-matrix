@@ -10,6 +10,16 @@ export function parseGesture(raw: string): Gesture | null {
     return GESTURES.includes(value as Gesture) ? value as Gesture : null
 }
 
+/** Small self-directed movements while nobody is talking: glancing at the scenery, the sky, musing. */
+export const IDLE_FIDGETS = ['look_around', 'look_up', 'tilt', 'sigh'] as const
+export type IdleFidget = typeof IDLE_FIDGETS[number]
+const FIDGET_SECONDS: Record<IdleFidget, number> = { look_around: 5, look_up: 4.5, tilt: 3, sigh: 3.2 }
+/** Rise, hold, then settle back: 0 → 1 → 0 over p ∈ [0, 1]. */
+const hold = (p: number) => {
+    const edge = (x: number) => x * x * (3 - 2 * x)
+    return p < 0.25 ? edge(p / 0.25) : p > 0.75 ? edge((1 - p) / 0.25) : 1
+}
+
 /** Additive rotations are removed before the animation mixer samples its next frame. */
 export class CompanionMotion {
     private offsets = new Map<THREE.Object3D, THREE.Quaternion>()
@@ -21,6 +31,12 @@ export class CompanionMotion {
     private pending: Gesture | null = null
     private pendingAt = 0
     private level = 0
+    private idleFor = 0
+    private nextFidgetAt = 0
+    private fidget: { name: IdleFidget; started: number; side: number } | null = null
+
+    constructor(private readonly random: () => number = Math.random) { this.nextFidgetAt = 14 + random() * 10 }
+    get currentFidget() { return this.fidget?.name ?? null }
 
     request(gesture: Gesture, waitForAudio: boolean) {
         if (this.time - this.lastGesture < 5) return
@@ -31,7 +47,7 @@ export class CompanionMotion {
         if (this.pending && this.time - this.pendingAt < 30) this.request(this.pending, false)
         this.pending = null
     }
-    cancel() { this.pending = null; this.gesture = null }
+    cancel() { this.pending = null; this.gesture = null; this.fidget = null }
     restore() {
         for (const [node, offset] of this.offsets) node.quaternion.multiply(offset.clone().invert())
         this.offsets.clear()
@@ -74,7 +90,9 @@ export class CompanionMotion {
                     add('rightHand', 0, Math.sin(age * 9) * envelope * 0.2)
                 }
             } else this.gesture = null
-        }
+            this.updateFidget(dt, state, add)
+        } else this.fidget = null
+
         for (const name of new Set([...targets.keys(), ...this.rotations.keys()])) {
             const value = this.rotations.get(name) ?? new THREE.Vector3()
             value.lerp(targets.get(name) ?? new THREE.Vector3(), 1 - Math.exp(-dt * 9))
@@ -84,6 +102,41 @@ export class CompanionMotion {
             const offset = new THREE.Quaternion().setFromEuler(new THREE.Euler(value.x, value.y, value.z))
             node.quaternion.multiply(offset)
             this.offsets.set(node, offset)
+        }
+    }
+
+    private updateFidget(dt: number, state: InteractionState, add: (name: VRMHumanBoneName, x?: number, y?: number, z?: number) => void) {
+        if (state !== 'idle' || this.gesture) {
+            this.fidget = null
+            this.idleFor = 0
+            this.nextFidgetAt = 14 + this.random() * 10
+            return
+        }
+        this.idleFor += dt
+        if (!this.fidget && this.idleFor >= this.nextFidgetAt) {
+            const name = IDLE_FIDGETS[Math.floor(this.random() * IDLE_FIDGETS.length)]!
+            this.fidget = { name, started: this.time, side: this.random() < 0.5 ? -1 : 1 }
+            this.nextFidgetAt = this.idleFor + FIDGET_SECONDS[name] + 16 + this.random() * 26
+        }
+        const f = this.fidget
+        if (!f) return
+        const p = (this.time - f.started) / FIDGET_SECONDS[f.name]
+        if (p >= 1) { this.fidget = null; return }
+        const e = hold(p)
+        if (f.name === 'look_around') {
+            add('head', 0.02 * e, f.side * 0.3 * e)
+            add('neck', 0, f.side * 0.16 * e)
+            add('spine', 0, f.side * 0.05 * e)
+        } else if (f.name === 'look_up') {
+            add('head', -0.2 * e)
+            add('neck', -0.08 * e)
+        } else if (f.name === 'tilt') {
+            add('head', 0, f.side * 0.05 * e, f.side * 0.13 * e)
+        } else {
+            const breath = Math.sin(Math.PI * p)
+            add('chest', -0.05 * breath)
+            add('spine', -0.02 * breath)
+            add('head', p > 0.5 ? 0.05 * Math.sin(Math.PI * (p - 0.5) * 2) : 0)
         }
     }
 }

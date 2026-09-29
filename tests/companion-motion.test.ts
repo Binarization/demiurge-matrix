@@ -48,3 +48,25 @@ test('additive motion never accumulates on unkeyed bones and reduced motion sett
     expect(a.hand.quaternion.angleTo(new THREE.Quaternion())).toBeLessThan(1e-5)
     expect(a.head.quaternion.angleTo(new THREE.Quaternion())).toBeLessThan(1e-5)
 })
+test('idle fidgets start only after sustained quiet, settle back and stop when she is addressed', () => {
+    let seed = 0
+    const motion = new CompanionMotion(() => (seed = (seed * 9301 + 49297) % 233280) / 233280)
+    const head = new THREE.Object3D()
+    const step = (state: 'idle' | 'listening', reduced = false) => {
+        motion.restore()
+        motion.update(1 / 60, state, 0, name => name === 'head' ? head : null, reduced)
+    }
+    for (let i = 0; i < 60 * 10; i++) step('idle')
+    expect(motion.currentFidget).toBeNull()
+    let seen = new Set<string>()
+    for (let i = 0; i < 60 * 240; i++) { step('idle'); if (motion.currentFidget) seen.add(motion.currentFidget) }
+    expect(seen.size).toBeGreaterThan(1)
+    for (let i = 0; i < 60 * 60 && !motion.currentFidget; i++) step('idle')
+    expect(motion.currentFidget).not.toBeNull()
+    step('listening')
+    expect(motion.currentFidget).toBeNull()
+    for (let i = 0; i < 60 * 5; i++) step('listening', true)
+    expect(head.quaternion.angleTo(new THREE.Quaternion())).toBeLessThan(1e-3)
+    for (let i = 0; i < 60 * 60; i++) step('idle', true)
+    expect(motion.currentFidget).toBeNull()
+})

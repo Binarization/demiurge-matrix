@@ -24,6 +24,10 @@ export class CameraDirector {
         if (!this.restoreView) this.restoreView = { view: this.view, revision: this.revision }
         this.select('full', origin, reduced, false)
     }
+    /** Remember the view without reframing; endAction then recenters gently unless the user took over. */
+    holdView() {
+        if (!this.restoreView) this.restoreView = { view: this.view, revision: this.revision }
+    }
     endAction(origin: THREE.Vector3, reduced: boolean) {
         const restore = this.restoreView; this.restoreView = null
         if (restore && restore.revision === this.revision) this.select(restore.view, origin, reduced, false)

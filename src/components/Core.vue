@@ -47,6 +47,7 @@ import { parseSceneCue } from '@/avatar/scene/commands'
 import { parseGesture } from '@/avatar/utils/CompanionMotion'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
+import { nextIdleBodyAction } from '@/lib/idle-life'
 import { EMOTION_NAMES, type EmotionName } from '@/avatar/utils/VrmController'
 
 // Emotion-tag parser. The agent emits a leading `<emote happy=0.7 ... />` tag
@@ -445,7 +446,10 @@ const onComposerInput = () => {
 }
 const onVisibilityChange = () => {
     if (document.hidden) closeSpeechInput()
-    else if (!isLoadingGreeting.value) void greetOnReturn()
+    else {
+        markActivity()
+        if (!isLoadingGreeting.value) void greetOnReturn()
+    }
 }
 const speechInputStatus = computed(
     () =>
@@ -658,15 +662,23 @@ const noticeScene = (text: string) => {
     sceneNoticeTimer = setTimeout(() => { sceneNotice.value = '' }, 3600)
 }
 const handleSceneEvent = (event: SceneEvent) => {
-    sceneBusy.value = event.phase === 'start'
-    sceneSeated.value = avatarRef.value?.getSceneState().seated ?? false
+    sceneBusy.value = event.phase === 'start' && !event.quiet
+    quietBusy = event.phase === 'start' && event.quiet === true
+    const seated = avatarRef.value?.getSceneState().seated ?? false
+    if (seated && !sceneSeated.value) seatedSince = Date.now()
+    if (!seated) seatedSince = null
+    sceneSeated.value = seated
     if (event.phase !== 'start') {
+        lastBodyAt = Date.now()
+        lastIdleBodyAction = event.quiet ? event.action : null
+        // A self-initiated action that got cut short never happened as far as the story goes.
+        if (event.quiet && event.phase === 'cancel') return
         session.sceneEvents ??= []
-        session.sceneEvents.push({ timestamp: Date.now(), action: event.label, outcome: event.phase })
+        session.sceneEvents.push({ timestamp: Date.now(), action: event.quiet ? `自己${event.label}` : event.label, outcome: event.phase })
         session.sceneEvents = session.sceneEvents.slice(-20)
         persistSession()
     }
-    noticeScene(event.phase === 'start' ? event.label : event.phase === 'cancel' ? '动作停下来了' : `${event.label} · 已完成`)
+    if (!event.quiet) noticeScene(event.phase === 'start' ? event.label : event.phase === 'cancel' ? '动作停下来了' : `${event.label} · 已完成`)
 }
 const requestBodyAction = (action: BodyAction) => {
     scenePanelOpen.value = false
@@ -678,10 +690,53 @@ const requestCameraView = (view: CameraView) => {
 }
 const flushSceneCue = () => {
     const cue = pendingSceneCue; pendingSceneCue = null
+    markActivity()
     if (cue?.body) requestBodyAction(cue.body)
     if (cue?.camera) avatarRef.value?.setCameraView(cue.camera)
 }
 onUnmounted(() => clearTimeout(sceneNoticeTimer))
+
+// Idle life: when the partner goes quiet she stretches, rests on the bench,
+// gets up again — quietly, without camera cuts or notices.
+let avatarReady = false
+let quietBusy = false
+let lastActivityAt = Date.now()
+let lastBodyAt = 0
+let lastIdleBodyAction: BodyAction | null = null
+let seatedSince: number | null = null
+const markActivity = () => {
+    lastActivityAt = Date.now()
+}
+const idleTick = () => {
+    const avatar = avatarRef.value
+    if (!avatar || !avatarReady || document.hidden || isLoadingGreeting.value || isResponding.value ||
+        activeSpeechId.value || speechInputActive.value || interactionState.value !== 'idle' ||
+        sceneBusy.value || quietBusy || customInput.value.trim()) return
+    const scene = avatar.getSceneState()
+    const position = scene.position ?? scene.home
+    const action = nextIdleBodyAction({
+        now: Date.now(),
+        lastActivityAt,
+        lastBodyAt,
+        lastBodyAction: lastIdleBodyAction,
+        seated: scene.seated,
+        seatedSince,
+        distanceFromHome: Math.hypot(position[0]! - scene.home[0]!, position[2]! - scene.home[2]!),
+        cameraView: scene.cameraView,
+        reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+    })
+    if (action) avatar.playBodyAction(action, { quiet: true })
+}
+const ACTIVITY_EVENTS = ['pointerdown', 'keydown', 'wheel', 'touchstart'] as const
+let idleTimer: ReturnType<typeof setInterval> | undefined
+onMounted(() => {
+    for (const name of ACTIVITY_EVENTS) window.addEventListener(name, markActivity, { passive: true })
+    idleTimer = setInterval(idleTick, 5000)
+})
+onUnmounted(() => {
+    for (const name of ACTIVITY_EVENTS) window.removeEventListener(name, markActivity)
+    clearInterval(idleTimer)
+})
 
 // 处理 Avatar 加载进度
 const handleAvatarProgress = (progress: number) => {
@@ -689,6 +744,8 @@ const handleAvatarProgress = (progress: number) => {
 }
 
 const handleAvatarReady = () => {
+    avatarReady = true
+    markActivity()
     const controller = avatarRef.value?.getVrmController?.()
     controller?.setMood(session.mood)
     controller?.setInteractionState(interactionState.value)
@@ -946,6 +1003,7 @@ const sendMessage = async (text: string) => {
     const generation = ++runGeneration
     suggestionGeneration++
     suggestions.value = []
+    markActivity()
     const due = dueFollowUps(session.followUps)
     const presence = presenceContext(session, due)
     if (due.length) {

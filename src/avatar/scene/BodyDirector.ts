@@ -6,7 +6,8 @@ import { solveLimb } from './ik'
 
 export const BODY_ACTIONS = ['approach', 'return', 'stretch', 'wave', 'offer_hand', 'headpat', 'sit', 'stand'] as const
 export type BodyAction = typeof BODY_ACTIONS[number]
-export type SceneEvent = { action: BodyAction; phase: 'start' | 'complete' | 'cancel'; label: string }
+/** `quiet`: self-initiated while nobody was talking; no camera cut or on-screen notice. */
+export type SceneEvent = { action: BodyAction; phase: 'start' | 'complete' | 'cancel'; label: string; quiet?: boolean }
 export const ACTION_LABELS: Record<BodyAction, string> = {
     approach: '走近一点', return: '回到原处', stretch: '伸个懒腰', wave: '挥挥手',
     offer_hand: '伸手回应', headpat: '轻轻摸头', sit: '坐一会儿', stand: '站起来',

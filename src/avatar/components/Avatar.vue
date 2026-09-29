@@ -330,8 +330,11 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
         vrmModel.scene.scale.setScalar(vrmScale.value)
 
         bodyDirector = new BodyDirector(modelVrm, event => {
+            const quiet = quietAction === event.action
+            if (event.phase !== 'start') quietAction = null
             if (cameraDirector && bodyDirector) {
-                if (event.phase === 'start' && ['approach', 'return', 'sit', 'stand', 'stretch'].includes(event.action)) {
+                if (event.phase === 'start' && quiet) cameraDirector.holdView()
+                else if (event.phase === 'start' && ['approach', 'return', 'sit', 'stand', 'stretch'].includes(event.action)) {
                     const origin = bodyDirector.position
                     if (event.action === 'sit') origin.x = (origin.x + SEAT.x) / 2
                     cameraDirector.beginAction(origin, reducedMotion())
@@ -346,7 +349,7 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
                 if (event.action === 'headpat') vrmController.applyEmotion({ relaxed: 0.5, happy: 0.2 })
                 if (event.action === 'wave' || event.action === 'offer_hand') vrmController.applyEmotion({ happy: 0.35 })
             }
-            emit('interaction', event)
+            emit('interaction', quiet ? { ...event, quiet } : event)
         })
         vrmController.bodyDirector = bodyDirector
         stageGeometry = createStageGeometry(new URLSearchParams(location.search).has('scene-debug'))
@@ -636,6 +639,10 @@ function animate() {
         }
 
         if (!isCameraAnimating) cameraDirector?.update(delta)
+        if (yieldTo && bodyDirector && !bodyDirector.busy) {
+            const action = yieldTo; yieldTo = null
+            bodyDirector.play(action)
+        }
 
         // 检测相机是否移动
         hasCameraMoved()
@@ -776,7 +783,7 @@ function hitRegion(event: PointerEvent): 'head' | 'hand' | 'body' | null {
 }
 function onContactStart(event: PointerEvent) {
     if (!event.isPrimary) { cancelContact(); return }
-    if (event.button !== 0 || isCameraAnimating || isPaused || bodyDirector?.busy) return
+    if (event.button !== 0 || isCameraAnimating || isPaused || (bodyDirector?.busy && !quietAction)) return
     const region = hitRegion(event)
     if (!region) return
     pointerContact = { id: event.pointerId, region, x: event.clientX, y: event.clientY, travel: 0, controlsEnabled: controls?.enabled ?? false }
@@ -799,14 +806,28 @@ function onContactEnd(event: PointerEvent) {
     const action = contact.region === 'head' ? 'headpat' : contact.region === 'hand' ? 'offer_hand' : 'wave'
     if (playBodyAction(action)) lastContactAt = performance.now()
 }
-function playBodyAction(action: BodyAction) { return bodyDirector?.play(action) ?? false }
+let quietAction: BodyAction | null = null
+/** Partner request waiting for her own interrupted movement to plant its feet. */
+let yieldTo: BodyAction | null = null
+function playBodyAction(action: BodyAction, options: { quiet?: boolean } = {}) {
+    // Anything the partner asks for takes over her own idle movement.
+    if (!options.quiet && quietAction && bodyDirector?.busy) {
+        bodyDirector.cancel()
+        vrmController.cancelGestures()
+        if (bodyDirector.busy) { yieldTo = action; return true }
+    }
+    if (options.quiet) quietAction = action
+    const started = bodyDirector?.play(action) ?? false
+    if (!started && options.quiet) quietAction = null
+    return started
+}
 function setCameraView(view: CameraView) {
     if (!bodyDirector || isCameraAnimating) return
     const origin = bodyDirector.position
     if (bodyDirector.seated) origin.y -= 0.38
     cameraDirector?.select(view, origin, reducedMotion())
 }
-function stopBodyAction() { bodyDirector?.cancel(); vrmController.cancelGestures() }
+function stopBodyAction() { yieldTo = null; bodyDirector?.cancel(); vrmController.cancelGestures() }
 
 /**
  * 页面可见性变化处理
@@ -1330,7 +1351,7 @@ defineExpose({
     playBodyAction,
     setCameraView,
     stopBodyAction,
-    getSceneState: () => ({ action: bodyDirector?.currentAction, seated: bodyDirector?.seated ?? false,
+    getSceneState: () => ({ action: bodyDirector?.currentAction, quiet: quietAction !== null, seated: bodyDirector?.seated ?? false,
         position: bodyDirector?.position.toArray(), floor: FLOOR_Y, home: HOME.toArray(), cameraView: cameraDirector?.view }),
     getVrmController: () => vrmController,
     getVrmModel: () => vrmModel,
