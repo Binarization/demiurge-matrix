@@ -1,6 +1,7 @@
 import type { ChatMessage } from './openrouter'
 import type { Tool } from './agent'
 import { emptyMood, normalizeMood, type Mood } from './interaction'
+import type { FollowUp } from './companion'
 
 export const CONVERSATION_KEY = 'demiurge_conversation_v1'
 export type ConversationEntry = {
@@ -10,6 +11,8 @@ export type ConversationEntry = {
     timestamp: number
     status: 'complete' | 'pending' | 'failed' | 'interrupted'
     speechInterrupted?: boolean
+    /** Opening line she spoke first when the partner came back. */
+    kind?: 'greeting'
 }
 export type ConversationSession = {
     version: 1
@@ -19,6 +22,7 @@ export type ConversationSession = {
     voiceEnabled: boolean
     voiceBackend?: 'webgpu' | 'wasm'
     sceneEvents?: Array<{ timestamp: number; action: string; outcome: 'complete' | 'cancel' }>
+    followUps?: FollowUp[]
 }
 export const createSession = (): ConversationSession => ({ version: 1, messages: [], mood: emptyMood(), moodUpdatedAt: Date.now(), voiceEnabled: false })
 export function loadConversation(storage: Pick<Storage, 'getItem'> = window.localStorage): ConversationSession {
@@ -32,9 +36,11 @@ export function loadConversation(storage: Pick<Storage, 'getItem'> = window.loca
             !['complete', 'pending', 'failed', 'interrupted'].includes(entry.status)) throw new Error('对话存档损坏，原存档未覆盖。')
         return { id: entry.id, role: entry.role, content: entry.content, timestamp: entry.timestamp,
             status: entry.status === 'pending' ? 'interrupted' : entry.status,
-            speechInterrupted: entry.speechInterrupted === true }
+            speechInterrupted: entry.speechInterrupted === true, ...(entry.kind === 'greeting' ? { kind: 'greeting' as const } : {}) }
     })
-    return { version: 1, messages, sceneEvents: Array.isArray(data.sceneEvents) ? data.sceneEvents.filter((event: any) => Number.isFinite(event?.timestamp) && typeof event.action === 'string' && ['complete', 'cancel'].includes(event.outcome)).slice(-20) : [], mood: normalizeMood(data.mood),
+    return { version: 1, messages, sceneEvents: Array.isArray(data.sceneEvents) ? data.sceneEvents.filter((event: any) => Number.isFinite(event?.timestamp) && typeof event.action === 'string' && ['complete', 'cancel'].includes(event.outcome)).slice(-20) : [],
+        followUps: Array.isArray(data.followUps) ? data.followUps.filter((item: any) => typeof item?.id === 'string' && typeof item.topic === 'string' &&
+            Number.isFinite(item.createdAt) && Number.isFinite(item.askAfter) && ['open', 'raised', 'dropped'].includes(item.status)) : [], mood: normalizeMood(data.mood),
         moodUpdatedAt: Number.isFinite(data.moodUpdatedAt) ? data.moodUpdatedAt : Date.now(), voiceEnabled: data.voiceEnabled === true && ['webgpu', 'wasm'].includes(data.voiceBackend),
         voiceBackend: data.voiceBackend === 'wasm' ? 'wasm' : 'webgpu' }
 }

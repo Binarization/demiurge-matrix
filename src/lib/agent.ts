@@ -4,7 +4,7 @@ import { OpenRouterClient } from './openrouter'
 import { memoryStore, type StoredMemory } from './memory-store'
 import { enqueueStoreMemory, formatMemoriesForPrompt, getRelevantMemories, memoryTools } from './memory-tools'
 import { hybridSearch, rerankWithLLM } from './memory-search'
-import { reflect } from './reflection'
+import { reflect, type ExtractedFollowUp } from './reflection'
 
 type ToolExecutionContext = {
     addMemory: (entry: MemoryEntry) => void
@@ -70,6 +70,8 @@ type AgentOptions = {
     /** Cheap model for reflection/rerank/summary. Falls back to main model. */
     auxiliaryModel?: string
     initialHistory?: ChatMessage[]
+    /** Receives follow-ups found by the reflection pass. */
+    onFollowUps?: (items: ExtractedFollowUp[]) => void
 }
 
 type AgentRunOptions = {
@@ -122,6 +124,7 @@ export class Agent {
     private readonly enableReflection: boolean
     private readonly enableEpisodicSummary: boolean
     private readonly auxiliaryModel?: string
+    private readonly onFollowUps?: (items: ExtractedFollowUp[]) => void
     private readonly toolRegistry = new Map<string, Tool>()
     private readonly history: ChatMessage[] = []
     private readonly memory: MemoryEntry[] = []
@@ -130,6 +133,7 @@ export class Agent {
     constructor(options: AgentOptions) {
         this.baseSystemPrompt = options.systemPrompt
         this.model = options.model
+        this.onFollowUps = options.onFollowUps
         this.maxRecursions = options.maxRecursions ?? 3
         this.maxContextMessages = options.maxContextMessages ?? 20
         this.autoInjectMemories = options.autoInjectMemories ?? true
@@ -503,6 +507,7 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
                 {
                     client: this.client,
                     model: this.auxiliaryModel ?? this.model,
+                    onFollowUps: this.onFollowUps,
                 }
             ).catch(err => console.warn('[Agent] reflection failed:', err))
         }

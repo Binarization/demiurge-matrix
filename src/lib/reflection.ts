@@ -13,6 +13,7 @@
 import type { OpenRouterClient } from './openrouter'
 import { type MemoryCategory, type MemorySubject } from './memory-store'
 import { enqueueStoreMemory } from './memory-tools'
+import { localClock } from './companion'
 
 export type ReflectionInput = {
     userMessage: string
@@ -46,29 +47,48 @@ const SYSTEM_PROMPT = `你是一名记忆抽取员。从一段"用户(伙伴)"�
 - 一次性的陈述（"我今天吃了米饭"）—— 除非明确"以后也吃"
 - 助手自己的人设描述（已存在系统提示中）
 
-按以下 JSON 数组格式输出（如果没有值得记的，返回空数组）：
-[
-  {
-    "content": "简短客观陈述（≤ 60 字）",
-    "category": "fact|preference|event|correction|context",
-    "subject": "user|character|world|relationship|other",
-    "importance": 1-10,
-    "confidence": 1-10,
-    "expires_in_days": 可选数字 (仅对临时承诺/计划)
-  }
-]
+另外，如果伙伴提到了之后才会有结果、值得过后关心一句的具体事情（考试、面试、看病、出行、截止日期、重要的见面），列入 follow_ups。只收伙伴本人明确说到的事，不收日常琐事，不替伙伴编造计划。
 
-只输出 JSON 数组，不要说明。`
-
-function parseJSONArray(text: string): unknown[] {
-    const match = text.match(/\[[\s\S]*\]/)
-    if (!match) return []
-    try {
-        const parsed = JSON.parse(match[0])
-        return Array.isArray(parsed) ? parsed : []
-    } catch {
-        return []
+按以下 JSON 对象格式输出（没有内容就用空数组）：
+{
+  "memories": [
+    {
+      "content": "简短客观陈述（≤ 60 字）",
+      "category": "fact|preference|event|correction|context",
+      "subject": "user|character|world|relationship|other",
+      "importance": 1-10,
+      "confidence": 1-10,
+      "expires_in_days": 可选数字 (仅对临时承诺/计划)
     }
+  ],
+  "follow_ups": [
+    { "topic": "之后要问起的事（≤ 20 字，如：周五面试的结果）", "ask_after_hours": 事情大概有结果后的小时数 }
+  ]
+}
+
+只输出 JSON，不要说明。`
+
+export type ExtractedFollowUp = { topic: string; askAfterHours: number }
+
+/** Accepts the `{memories, follow_ups}` object or a legacy bare memory array. */
+export function parseReflection(text: string): { memories: unknown[]; followUps: ExtractedFollowUp[] } {
+    const tryParse = (source: string | undefined) => {
+        if (!source) return undefined
+        try {
+            return JSON.parse(source)
+        } catch {
+            return undefined
+        }
+    }
+    const parsed = tryParse(text.match(/\{[\s\S]*\}/)?.[0]) ?? tryParse(text.match(/\[[\s\S]*\]/)?.[0])
+    if (Array.isArray(parsed)) return { memories: parsed, followUps: [] }
+    if (!parsed || typeof parsed !== 'object') return { memories: [], followUps: [] }
+    const followUps = (Array.isArray(parsed.follow_ups) ? parsed.follow_ups : []).flatMap((item: any): ExtractedFollowUp[] => {
+        const topic = typeof item?.topic === 'string' ? item.topic.trim() : ''
+        const hours = Number(item?.ask_after_hours)
+        return topic && topic.length <= 40 && Number.isFinite(hours) && hours > 0 ? [{ topic, askAfterHours: hours }] : []
+    })
+    return { memories: Array.isArray(parsed.memories) ? parsed.memories : [], followUps }
 }
 
 function sanitize(item: unknown): ExtractedMemory | null {
@@ -94,6 +114,8 @@ export type ReflectionOptions = {
     client: OpenRouterClient
     /** Cheap model used for extraction. Defaults to whatever the client is set to. */
     model?: string
+    /** Receives things worth asking about later. */
+    onFollowUps?: (items: ExtractedFollowUp[]) => void
 }
 
 /**
@@ -104,7 +126,7 @@ export async function reflect(input: ReflectionInput, options: ReflectionOptions
     if (!input.userMessage.trim() && !input.assistantMessage.trim()) return []
 
     const priorBlock = (input.priorContext ?? []).slice(-4).join('\n')
-    const transcript = `${priorBlock ? priorBlock + '\n' : ''}伙伴：${input.userMessage}\n昔涟：${input.assistantMessage}`
+    const transcript = `【当前伙伴本地时间】${localClock(new Date())}\n${priorBlock ? priorBlock + '\n' : ''}伙伴：${input.userMessage}\n昔涟：${input.assistantMessage}`
 
     let raw: string
     try {
@@ -121,7 +143,9 @@ export async function reflect(input: ReflectionInput, options: ReflectionOptions
         return []
     }
 
-    const extracted = parseJSONArray(raw).map(sanitize).filter((x): x is ExtractedMemory => x !== null)
+    const parsed = parseReflection(raw)
+    if (parsed.followUps.length) options.onFollowUps?.(parsed.followUps)
+    const extracted = parsed.memories.map(sanitize).filter((x): x is ExtractedMemory => x !== null)
     if (extracted.length === 0) return []
 
     const created: string[] = []

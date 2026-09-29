@@ -14,6 +14,14 @@ import {
 import { LocalVoiceController, type VoiceBackend } from '@/lib/voice/controller'
 import type { PhraseStream } from '@/lib/voice/phrase-stream'
 import { advanceMood, restingMood, type InteractionState } from '@/lib/interaction'
+import {
+    addFollowUps,
+    dueFollowUps,
+    presenceContext,
+    returnBrief,
+    settleFollowUps,
+    shouldGreetOnReturn,
+} from '@/lib/companion'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
 import IconCog from '~icons/mdi/cog'
 import IconBrain from '~icons/mdi/brain'
@@ -437,6 +445,7 @@ const onComposerInput = () => {
 }
 const onVisibilityChange = () => {
     if (document.hidden) closeSpeechInput()
+    else if (!isLoadingGreeting.value) void greetOnReturn()
 }
 const speechInputStatus = computed(
     () =>
@@ -456,6 +465,54 @@ const scrollMessagesToBottom = () => {
             container.scrollTop = container.scrollHeight
         }
     })
+}
+
+/**
+ * Opening line when the partner comes back after a while. Grounded in the
+ * real transcript tail and due follow-ups; returns null when unavailable.
+ */
+const generateReturnGreeting = async (brief: string): Promise<string | null> => {
+    const stored = loadStoredOpenRouterConfig()
+    if (!stored?.apiKey) return null
+    try {
+        const client = new OpenRouterClient({ apiKey: stored.apiKey, model: stored.model ?? getDefaultConfig().model })
+        const memories = formatMemoriesForPrompt(await getGreetingMemories().catch(() => []))
+        const response = await client.sendChat(
+            [
+                { role: 'system', content: buildCyrenePrompt('return') + memories + `\n【回访情况】\n${brief}` },
+                { role: 'user', content: '伙伴刚刚回来，还没有说话。你先开口。' },
+            ],
+            { model: stored.model ?? getDefaultConfig().model }
+        )
+        const text = response?.choices?.[0]?.message?.content?.trim()
+        return text && text.length < 160 ? text : null
+    } catch (error) {
+        console.warn('Failed to generate return greeting:', error)
+        return null
+    }
+}
+
+let returnGreetingInFlight = false
+const greetOnReturn = async () => {
+    if (returnGreetingInFlight || !configured.value || isResponding.value || activeSpeechId.value) return
+    if (!shouldGreetOnReturn(session)) return
+    returnGreetingInFlight = true
+    const due = dueFollowUps(session.followUps)
+    const lastId = session.messages[session.messages.length - 1]?.id
+    try {
+        const greeting = await generateReturnGreeting(returnBrief(session, due))
+        // Drop it if the partner started talking meanwhile.
+        if (!greeting || disposed || session.messages[session.messages.length - 1]?.id !== lastId) return
+        appendEntry('assistant', greeting).kind = 'greeting'
+        session.followUps = settleFollowUps(session.followUps, due)
+        persistSession()
+        // Rebuild the agent from the transcript so it sees the new opening line.
+        agentInstance = null
+        dispatchEmotion(greeting)
+        scrollMessagesToBottom()
+    } finally {
+        returnGreetingInFlight = false
+    }
 }
 
 /**
@@ -542,6 +599,11 @@ const ensureAgent = (): Agent => {
         agentInstance = new Agent({
             systemPrompt: buildCyrenePrompt(),
             initialHistory: recentConversation(session.messages),
+            onFollowUps: items => {
+                if (disposed) return
+                session.followUps = addFollowUps(session.followUps, items)
+                persistSession()
+            },
             tools: [conversationRecallTool(() => session.messages)],
             model: stored.model ?? getDefaultConfig().model,
             maxContextMessages: 20, // Limit context to 20 conversation turns
@@ -884,6 +946,11 @@ const sendMessage = async (text: string) => {
     const generation = ++runGeneration
     suggestionGeneration++
     suggestions.value = []
+    const due = dueFollowUps(session.followUps)
+    const presence = presenceContext(session, due)
+    if (due.length) {
+        session.followUps = settleFollowUps(session.followUps, due)
+    }
     const requestedAt = performance.now()
     firstAudioLatency.value = ''
     const abort = new AbortController()
@@ -928,7 +995,7 @@ const sendMessage = async (text: string) => {
                 scrollMessagesToBottom()
             },
             signal: abort.signal,
-            interactionContext: `当前时间：${new Date().toISOString()}。上一轮心境强度：${JSON.stringify(session.mood)}。当前场景状态：${JSON.stringify(avatarRef.value?.getSceneState())}。最近实际场景互动：${JSON.stringify(session.sceneEvents?.slice(-6) ?? [])}。没有接入摄像头；用户消息可能来自键盘或用户确认发送的语音转写。`,
+            interactionContext: `${presence}上一轮心境强度：${JSON.stringify(session.mood)}。当前场景状态：${JSON.stringify(avatarRef.value?.getSceneState())}。最近实际场景互动：${JSON.stringify(session.sceneEvents?.slice(-6) ?? [])}。没有接入摄像头；用户消息可能来自键盘或用户确认发送的语音转写。`,
         })
         if (generation !== runGeneration || disposed) return
         entry.status = 'complete'
@@ -1011,8 +1078,12 @@ onMounted(async () => {
         if (!session.messages.length) {
             const greeting = await generatePersonalizedGreeting()
             if (disposed) return
-            appendEntry('assistant', greeting)
+            appendEntry('assistant', greeting).kind = 'greeting'
+            persistSession()
             dispatchEmotion(greeting)
+        } else if (configured.value && shouldGreetOnReturn(session)) {
+            await greetOnReturn()
+            if (disposed) return
         }
         if (!disposed && configured.value) ensureAgent()
     } catch (error) {
