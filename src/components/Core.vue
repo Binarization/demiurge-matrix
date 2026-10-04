@@ -18,9 +18,12 @@ import {
     addFollowUps,
     dueFollowUps,
     presenceContext,
+    quietBrief,
     returnBrief,
+    shouldSpeakWhileQuiet,
     settleFollowUps,
     shouldGreetOnReturn,
+    type FollowUp,
 } from '@/lib/companion'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
 import IconCog from '~icons/mdi/cog'
@@ -472,10 +475,15 @@ const scrollMessagesToBottom = () => {
 }
 
 /**
- * Opening line when the partner comes back after a while. Grounded in the
- * real transcript tail and due follow-ups; returns null when unavailable.
+ * A line she speaks first: when the partner comes back after a while, or when
+ * they have stayed but gone quiet. Grounded in the real transcript tail, due
+ * follow-ups and her own recent doings; returns null when unavailable.
  */
-const generateReturnGreeting = async (brief: string): Promise<string | null> => {
+const OPENING_NUDGE = {
+    return: '伙伴刚刚回来，还没有说话。你先开口。',
+    quiet: '伙伴还在，但安静了一会儿。你轻轻说一句。',
+} as const
+const generateOpeningLine = async (mode: keyof typeof OPENING_NUDGE, brief: string): Promise<string | null> => {
     const stored = loadStoredOpenRouterConfig()
     if (!stored?.apiKey) return null
     try {
@@ -483,40 +491,49 @@ const generateReturnGreeting = async (brief: string): Promise<string | null> => 
         const memories = formatMemoriesForPrompt(await getGreetingMemories().catch(() => []))
         const response = await client.sendChat(
             [
-                { role: 'system', content: buildCyrenePrompt('return') + memories + `\n【回访情况】\n${brief}` },
-                { role: 'user', content: '伙伴刚刚回来，还没有说话。你先开口。' },
+                { role: 'system', content: buildCyrenePrompt(mode) + memories + `\n【${mode === 'return' ? '回访情况' : '此刻情况'}】\n${brief}` },
+                { role: 'user', content: OPENING_NUDGE[mode] },
             ],
             { model: stored.model ?? getDefaultConfig().model }
         )
         const text = response?.choices?.[0]?.message?.content?.trim()
         return text && text.length < 160 ? text : null
     } catch (error) {
-        console.warn('Failed to generate return greeting:', error)
+        console.warn('Failed to generate opening line:', error)
         return null
     }
 }
 
-let returnGreetingInFlight = false
-const greetOnReturn = async () => {
-    if (returnGreetingInFlight || !configured.value || isResponding.value || activeSpeechId.value) return
-    if (!shouldGreetOnReturn(session)) return
-    returnGreetingInFlight = true
+let openingInFlight = false
+const speakFirst = async (mode: keyof typeof OPENING_NUDGE, brief: (due: FollowUp[]) => string) => {
+    if (openingInFlight || !configured.value || isResponding.value || activeSpeechId.value) return
+    openingInFlight = true
     const due = dueFollowUps(session.followUps)
     const lastId = session.messages[session.messages.length - 1]?.id
     try {
-        const greeting = await generateReturnGreeting(returnBrief(session, due))
-        // Drop it if the partner started talking meanwhile.
-        if (!greeting || disposed || session.messages[session.messages.length - 1]?.id !== lastId) return
-        appendEntry('assistant', greeting).kind = 'greeting'
+        const line = await generateOpeningLine(mode, brief(due))
+        // Drop it if the partner started talking (or typing) meanwhile.
+        if (!line || disposed || session.messages[session.messages.length - 1]?.id !== lastId) return
+        if (mode === 'quiet' && (document.hidden || customInput.value.trim() || speechInputActive.value)) return
+        appendEntry('assistant', line).kind = 'greeting'
         session.followUps = settleFollowUps(session.followUps, due)
         persistSession()
         // Rebuild the agent from the transcript so it sees the new opening line.
         agentInstance = null
-        dispatchEmotion(greeting)
+        dispatchEmotion(line)
         scrollMessagesToBottom()
     } finally {
-        returnGreetingInFlight = false
+        openingInFlight = false
     }
+}
+const greetOnReturn = async () => {
+    if (!shouldGreetOnReturn(session)) return
+    await speakFirst('return', due => returnBrief(session, due))
+}
+// She has stayed quiet with the partner for a long while; one soft line, then she waits.
+const speakWhileQuiet = () => {
+    if (document.hidden || !shouldSpeakWhileQuiet(session, { now: Date.now(), lastActivityAt })) return
+    void speakFirst('quiet', due => quietBrief(session, due, Date.now() - lastActivityAt))
 }
 
 /**
@@ -735,6 +752,7 @@ const idleTick = () => {
     if (!avatar || !avatarReady || document.hidden || isLoadingGreeting.value || isResponding.value ||
         activeSpeechId.value || speechInputActive.value || interactionState.value !== 'idle' ||
         sceneBusy.value || quietBusy || customInput.value.trim()) return
+    speakWhileQuiet()
     const scene = avatar.getSceneState()
     const position = scene.position ?? scene.home
     const action = nextIdleBodyAction({

@@ -57,6 +57,24 @@ export function localClock(now: Date): string {
 const lastUserEntry = (messages: ConversationEntry[]) =>
     [...messages].reverse().find(entry => entry.role === 'user' && entry.status === 'complete')
 
+/** Page open but nobody has said anything for this long: she may say one soft line. */
+export const QUIET_SPEAK_AFTER_MS = 12 * 60_000
+
+export type QuietState = { now: number; lastActivityAt: number }
+
+/**
+ * May she break a long silence while the partner is (apparently) still here?
+ * Only once per silence: her unprompted line is a `greeting`, and she never
+ * stacks a second one before the partner answers. A failed or interrupted turn
+ * is not hers to talk over.
+ */
+export function shouldSpeakWhileQuiet(session: ConversationSession, state: QuietState): boolean {
+    const last = session.messages[session.messages.length - 1]
+    if (!last || last.kind === 'greeting' || last.status !== 'complete') return false
+    const quietFor = Math.min(state.now - last.timestamp, state.now - state.lastActivityAt)
+    return quietFor >= QUIET_SPEAK_AFTER_MS
+}
+
 /** Should she speak first on this visit? */
 export function shouldGreetOnReturn(session: ConversationSession, now = Date.now()): boolean {
     const last = session.messages[session.messages.length - 1]
@@ -113,6 +131,25 @@ export function presenceContext(session: ConversationSession, due: FollowUp[], n
     if (due.length)
         parts.push(`伙伴之前提过、现在可能已有结果的事：${due.map(item => item.topic).join('；')}。若与当前话题不冲突，可以自然关心一句；伙伴正忙着说别的就先放下，不追问。`)
     return parts.join('')
+}
+
+/** Context for the line she offers when the partner has gone quiet but stayed. */
+export function quietBrief(session: ConversationSession, due: FollowUp[], quietForMs: number, now = Date.now()): string {
+    const recent = session.messages
+        .filter(entry => entry.status === 'complete')
+        .slice(-4)
+        .map(entry => `${entry.role === 'user' ? '伙伴' : '昔涟'}：${entry.content.replace(/^\s*<emote\b[^>]*>\s*/i, '').slice(0, 120)}`)
+    const own = (session.sceneEvents ?? [])
+        .filter(event => event.outcome === 'complete' && event.action.startsWith('自己') && now - event.timestamp < 30 * 60_000)
+        .slice(-3)
+        .map(event => event.action)
+    return [
+        `伙伴本地时间：${localClock(new Date(now))}。`,
+        `页面还开着，但伙伴已经${describeGap(quietForMs)}没有动静；不知道是在忙别的还是在看着你。`,
+        recent.length ? `刚才的对话（真实记录）：\n${recent.join('\n')}` : '',
+        own.length ? `这段安静里你自己做过的小事：${own.join('；')}。` : '',
+        due.length ? `伙伴之前提过、现在可能已有结果的事：${due.map(item => item.topic).join('；')}。只在合适时轻轻问一件。` : '',
+    ].filter(Boolean).join('\n')
 }
 
 /** Context for the "you're back" opening line. */

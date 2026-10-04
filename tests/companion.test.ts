@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { addFollowUps, describeGap, dueFollowUps, presenceContext, returnBrief, settleFollowUps, shouldGreetOnReturn } from '../src/lib/companion'
+import { addFollowUps, describeGap, dueFollowUps, presenceContext, quietBrief, returnBrief, settleFollowUps, shouldGreetOnReturn, shouldSpeakWhileQuiet } from '../src/lib/companion'
 import { createSession, loadConversation, saveConversation } from '../src/lib/conversation-store'
 import { parseReflection } from '../src/lib/reflection'
 
@@ -72,4 +72,38 @@ test('reflection output parses both the object form and the legacy array', () =>
     expect(legacy.memories).toHaveLength(2)
     expect(legacy.followUps).toEqual([])
     expect(parseReflection('没有')).toEqual({memories:[],followUps:[]})
+})
+
+test('she breaks a long silence at most once, and only after a completed exchange', () => {
+    const now = 200 * HOUR
+    const session = createSession()
+    const state = { now, lastActivityAt: now - 15 * 60_000 }
+    expect(shouldSpeakWhileQuiet(session, state)).toBe(false)
+    session.messages.push({id:'u',role:'user',content:'嗯',timestamp:now - 20 * 60_000,status:'complete'},
+        {id:'a',role:'assistant',content:'<emote/> 好。',timestamp:now - 20 * 60_000,status:'complete'})
+    expect(shouldSpeakWhileQuiet(session, { now, lastActivityAt: now - 5 * 60_000 })).toBe(false)
+    expect(shouldSpeakWhileQuiet(session, state)).toBe(true)
+    session.messages.push({id:'q',role:'assistant',content:'<emote/> 光移到秋千上了。',timestamp:now - 60_000,status:'complete',kind:'greeting'})
+    expect(shouldSpeakWhileQuiet(session, { now: now + 2 * HOUR, lastActivityAt: now - 15 * 60_000 })).toBe(false)
+    const failed = createSession()
+    failed.messages.push({id:'u',role:'user',content:'？',timestamp:now - HOUR,status:'interrupted'})
+    expect(shouldSpeakWhileQuiet(failed, state)).toBe(false)
+})
+
+test('the quiet brief tells her how long it has been and what she did meanwhile', () => {
+    const now = new Date(2026, 9, 4, 15, 10).getTime()
+    const session = createSession()
+    session.messages.push({id:'u',role:'user',content:'先去忙了',timestamp:now - 14 * 60_000,status:'complete'},
+        {id:'a',role:'assistant',content:'<emote relaxed=0.3/> 去吧。',timestamp:now - 14 * 60_000,status:'complete'})
+    session.sceneEvents = [
+        {timestamp: now - 9 * 60_000, action: '自己想起了：伙伴喜欢星星', outcome: 'complete'},
+        {timestamp: now - 8 * 60_000, action: '挥手', outcome: 'complete'},
+        {timestamp: now - 2 * HOUR, action: '自己伸懒腰', outcome: 'complete'},
+    ]
+    const brief = quietBrief(session, [], 13 * 60_000, now)
+    expect(brief).toContain('约13分钟没有动静')
+    expect(brief).toContain('昔涟：去吧。')
+    expect(brief).toContain('自己想起了：伙伴喜欢星星')
+    expect(brief).not.toContain('挥手')
+    expect(brief).not.toContain('伸懒腰')
 })
