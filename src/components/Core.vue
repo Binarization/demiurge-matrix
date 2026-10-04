@@ -138,6 +138,18 @@ const historyPinned = ref(true)
 const latestReply = computed(() =>
     [...messages.value].reverse().find(message => message.sender === 'ally')
 )
+// The partner's own last line stays in view: bright until she has answered it, then dimmed.
+const latestPartnerLine = computed(() =>
+    [...messages.value].reverse().find(message => message.sender === 'self')
+)
+const partnerLinePending = computed(() => {
+    const line = latestPartnerLine.value
+    if (!line) return false
+    if (isResponding.value) return true
+    const list = messages.value
+    const replyIndex = latestReply.value ? list.indexOf(latestReply.value) : -1
+    return list.indexOf(line) > replyIndex
+})
 const openHistory = () => {
     closeSpeechInput()
     isChatOpen.value = true
@@ -1301,6 +1313,18 @@ defineExpose({
         </div>
         <main v-show="!quietMode" class="companion-dock" aria-label="与昔涟对话">
             <section class="reply-caption" aria-label="昔涟的回复">
+                <Transition name="soft-reveal">
+                    <p
+                        v-if="latestPartnerLine"
+                        :key="latestPartnerLine.id"
+                        class="partner-line"
+                        :class="{ 'partner-line--answered': !partnerLinePending }"
+                        aria-label="你刚才说的"
+                    >
+                        <span class="partner-line-mark" aria-hidden="true">你</span
+                        >{{ latestPartnerLine.text }}
+                    </p>
+                </Transition>
                 <div class="caption-byline">
                     <span
                         class="presence-dot"
@@ -2157,6 +2181,34 @@ defineExpose({
 }
 .presence-dot--busy {
     animation: breathing 2s ease-in-out infinite;
+}
+.partner-line {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    margin: 0 0 12px;
+    color: #f3edf5;
+    font-size: 13.5px;
+    line-height: 1.6;
+    letter-spacing: 0.02em;
+    overflow-wrap: anywhere;
+    transition: opacity 0.7s ease;
+}
+.partner-line--answered {
+    opacity: 0.55;
+}
+.partner-line-mark {
+    display: inline-block;
+    margin-right: 8px;
+    padding: 0 6px;
+    border: 1px solid #e7e2ee55;
+    border-radius: 9px;
+    font-size: 10px;
+    line-height: 16px;
+    letter-spacing: 0.08em;
+    color: #e7e2eecc;
+    vertical-align: 1px;
 }
 .caption-text {
     max-height: 132px;
