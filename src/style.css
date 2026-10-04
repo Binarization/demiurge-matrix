@@ -1,1 +1,11 @@
 @import 'tailwindcss';
+
+/* The landing's pixel face, kept for small system labels in the scene so the
+   two screens read as one piece: pixel for the machine, serif for her. */
+@font-face {
+    font-family: 'Ark Pixel';
+    src: url('/fonts/ark-pixel-12px-monospaced-zh_cn.ttf.woff2') format('woff2');
+    font-weight: normal;
+    font-style: normal;
+    font-display: swap;
+}

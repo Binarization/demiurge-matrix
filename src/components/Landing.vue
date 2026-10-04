@@ -1012,14 +1012,6 @@ onUnmounted(() => {
     animation: explosion-grow 1.2s cubic-bezier(0.19, 1, 0.22, 1) forwards;
 }
 
-@font-face {
-     font-family: 'Ark Pixel';
-     src: url('/fonts/ark-pixel-12px-monospaced-zh_cn.ttf.woff2') format('woff2');
-     font-weight: normal;
-     font-style: normal;
-     font-display: swap;
-}
-
 @keyframes explosion-grow {
     0% {
         opacity: 1;

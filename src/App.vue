@@ -22,8 +22,12 @@ const handleExplosionStart = () => {
         })
     }, 500)
 }
+// After the landing's white burst, the scene is revealed through a dissolving
+// veil instead of a hard cut: light first, then colour, then her.
+const veil = ref(false)
 const handleLandingComplete = () => {
     entered.value = true
+    veil.value = true
     coreRef.value?.getAvatar()?.resume()
 }
 // Music starts only from this explicit action, never from arbitrary input.
@@ -69,6 +73,7 @@ onBeforeUnmount(() => {
             @dismiss-music-error="musicError = ''"
             @loading="avatarProgress = $event"
         />
+        <div v-if="veil" class="arrival-veil" aria-hidden="true" @animationend="veil = false"></div>
         <Transition name="arrival-fade"
             ><Landing
                 v-if="!entered"
@@ -95,14 +100,36 @@ onBeforeUnmount(() => {
     position: relative;
 }
 .arrival-fade-leave-active {
-    transition: opacity 0.25s ease-out;
+    transition:
+        opacity 0.7s ease-out,
+        transform 0.7s ease-out;
 }
 .arrival-fade-leave-to {
     opacity: 0;
+    transform: scale(1.03);
+}
+.arrival-veil {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    pointer-events: none;
+    background: #fff;
+    animation: arrival-dissolve 1.8s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+@keyframes arrival-dissolve {
+    0% { opacity: 1; }
+    35% { opacity: 0.55; background: #f7e3cf; }
+    100% { opacity: 0; background: #e2b8cc; }
 }
 @media (prefers-reduced-motion: reduce) {
     .arrival-fade-leave-active {
-        transition: none;
+        transition: opacity 0.2s ease-out;
+    }
+    .arrival-fade-leave-to {
+        transform: none;
+    }
+    .arrival-veil {
+        animation-duration: 0.3s;
     }
 }
 </style>

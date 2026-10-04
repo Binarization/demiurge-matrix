@@ -2146,8 +2146,8 @@ defineExpose({
     letter-spacing: 0.14em;
 }
 .presence-mark small {
-    font-size: 10px;
-    letter-spacing: 0.18em;
+    font: 400 11px/1 'Ark Pixel', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    letter-spacing: 0.22em;
     margin-left: 8px;
     color: #e7e2eeb3;
 }
