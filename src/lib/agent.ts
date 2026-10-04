@@ -113,6 +113,21 @@ type OpenRouterToolDefinition = {
     }
 }
 
+/**
+ * Words that mean the answer may depend on stored memory or the transcript:
+ * questions, names, dates, promises. Anything else that is this short is small
+ * talk, and the planning round-trip would only delay the first sound.
+ */
+const RECALL_MARKERS = ['?', '？', '记', '约', '上次', '昨', '前', '什么', '哪', '几', '吗', '忘', '名', '叫', '谁', '多久', '生日']
+const SMALL_TALK_MAX_CHARS = 8
+
+/** Skip the tool-planning request for short small talk when the last turn needed no tools. */
+export function shouldSkipPlanning(userInput: string, lastTurnUsedTools: boolean): boolean {
+    const text = userInput.trim()
+    if (!text || text.length > SMALL_TALK_MAX_CHARS || lastTurnUsedTools) return false
+    return !RECALL_MARKERS.some(marker => text.includes(marker))
+}
+
 const CATEGORY_ENUM = ['fact', 'preference', 'event', 'correction', 'context']
 const SUBJECT_ENUM = ['user', 'character', 'world', 'relationship', 'other']
 
@@ -355,6 +370,16 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
      * turn like "为什么？" yields nothing on its own — joining the last 2-3
      * turns gives the retriever real signal.
      */
+    /** Did the previous turn (since its user message) call any tool? */
+    private lastTurnUsedTools(): boolean {
+        for (let i = this.history.length - 1; i >= 0; i--) {
+            const message = this.history[i]!
+            if (message.role === 'user') return false
+            if (message.role === 'assistant' && message.tool_calls?.length) return true
+        }
+        return false
+    }
+
     private buildRetrievalQuery(latestInput: string): string {
         const recent = this.history
             .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -370,6 +395,7 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
         options.signal?.throwIfAborted()
 
         const retrievalQuery = this.buildRetrievalQuery(userInput)
+        const lastTurnUsedTools = this.lastTurnUsedTools()
         this.history.push({ role: 'user', content: userInput })
 
         const maxRecursions = options.maxRecursions ?? this.maxRecursions
@@ -377,19 +403,26 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
         let finalContent = ''
         let lastRaw: unknown
 
-        // Hybrid retrieval + optional LLM rerank
+        // Hybrid retrieval + optional LLM rerank. When streaming, the rerank
+        // runs alongside tool planning instead of ahead of it: planning sees
+        // the hybrid top-N, the final answer waits for the reranked set.
+        let rerankPending: Promise<StoredMemory[]> | null = null
         if (this.autoInjectMemories) {
             try {
                 const candidates = await hybridSearch(retrievalQuery, {
                     limit: this.maxInjectedMemories * 2,
                 })
                 if (this.enableRerank && candidates.length > this.maxInjectedMemories) {
-                    this.injectedMemories = await rerankWithLLM(retrievalQuery, candidates, {
+                    const rerank = rerankWithLLM(retrievalQuery, candidates, {
                         client: this.client,
                         model: this.auxiliaryModel ?? this.model,
                         limit: this.maxInjectedMemories,
                         contextHint: userInput,
                     })
+                    if (options.stream) {
+                        this.injectedMemories = candidates.slice(0, this.maxInjectedMemories)
+                        rerankPending = rerank
+                    } else this.injectedMemories = await rerank
                 } else {
                     // Fall back to hybrid + pinned strongest
                     this.injectedMemories = await getRelevantMemories(retrievalQuery, this.maxInjectedMemories)
@@ -403,9 +436,10 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
         }
 
         options.signal?.throwIfAborted()
-        const systemPrompt = this.buildSystemPrompt(this.injectedMemories) +
-            (options.interactionContext ? `\n【本次交互状态】\n${options.interactionContext}` : '')
-        const tools = this.getToolDefinitions()
+        const interactionBlock = options.interactionContext ? `\n【本次交互状态】\n${options.interactionContext}` : ''
+        let systemPrompt = this.buildSystemPrompt(this.injectedMemories) + interactionBlock
+        // Short small talk goes straight to the spoken answer; nothing to plan.
+        const tools = options.stream && shouldSkipPlanning(userInput, lastTurnUsedTools) ? [] : this.getToolDefinitions()
 
         // Tools run before the public answer: speech cannot retract a tool preamble.
         // The explicit finish tool lets planning stop without generating an unused answer.
@@ -422,7 +456,8 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
 
             /* eslint-disable no-await-in-loop */
             const response: any = await this.client.sendChat(messages, {
-                model: this.model,
+                // Planning only chooses tools; a fast auxiliary model is enough for that.
+                model: options.stream ? this.auxiliaryModel ?? this.model : this.model,
                 stream: false,
                 tools: options.stream ? [...tools, responseTool] : tools.length > 0 ? tools : undefined,
                 toolChoice: options.stream ? 'required' : undefined,
@@ -483,6 +518,15 @@ confidence：用户明说=9-10 | 你推断=5-7 | 不确定=1-4
 
         if (options.stream) {
             options.signal?.throwIfAborted()
+            if (rerankPending) {
+                try {
+                    this.injectedMemories = await rerankPending
+                    systemPrompt = this.buildSystemPrompt(this.injectedMemories) + interactionBlock
+                } catch (error) {
+                    console.warn('[Agent] rerank failed, keeping hybrid order:', error)
+                }
+                options.signal?.throwIfAborted()
+            }
             const response = await this.client.sendChat(this.buildMessagesForAPI(systemPrompt +
                 '\n现在只输出面向伙伴的最终回答。首个短语自然简短；不要输出工具操作或内部思考。'), {
                 model: this.model, stream: true, signal: options.signal,

@@ -184,9 +184,11 @@ let agentInstance: Agent | null = null
 const getDefaultConfig = () => ({
     apiKey: '',
     model: 'z-ai/glm-4.5-air:free',
+    auxiliaryModel: undefined as string | undefined,
 })
 
 const settingsForm = reactive({
+    auxiliaryModel: '',
     apiKey: getDefaultConfig().apiKey,
     model: getDefaultConfig().model,
 })
@@ -659,6 +661,7 @@ const ensureAgent = (): Agent => {
             },
             tools: [conversationRecallTool(() => session.messages)],
             model: stored.model ?? getDefaultConfig().model,
+            auxiliaryModel: stored.auxiliaryModel || undefined,
             maxContextMessages: 20, // Limit context to 20 conversation turns
             enableMemoryTools: true, // Enable memory tools
             autoInjectMemories: true, // Auto-inject relevant memories
@@ -687,6 +690,7 @@ const handleSettingsSubmit = () => {
     saveStoredOpenRouterConfig({
         apiKey: settingsForm.apiKey.trim(),
         model: settingsForm.model.trim() || undefined,
+        auxiliaryModel: settingsForm.auxiliaryModel.trim() || undefined,
     })
     settingsSaved.value = true
     configured.value = true
@@ -1191,6 +1195,7 @@ onMounted(async () => {
     if (stored) {
         settingsForm.apiKey = stored.apiKey ?? defaultConfig.apiKey
         settingsForm.model = stored.model ?? defaultConfig.model
+        settingsForm.auxiliaryModel = stored.auxiliaryModel ?? ''
     } else {
         // First launch: leave credentials empty and prompt for configuration.
         settingsForm.apiKey = defaultConfig.apiKey
@@ -1640,6 +1645,12 @@ defineExpose({
                             v-model="settingsForm.model"
                             type="text"
                             placeholder="如：google/gemini-2.5-flash"
+                    /></label
+                    ><label class="field"
+                        >快速模型（可选）<input
+                            v-model="settingsForm.auxiliaryModel"
+                            type="text"
+                            placeholder="用于工具规划与记忆整理，留空则同上"
                     /></label>
                     <div class="form-footer">
                         <span v-if="settingsSaved" role="status">已保存</span

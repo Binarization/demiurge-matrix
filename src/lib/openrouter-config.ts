@@ -3,6 +3,8 @@ export const OPENROUTER_STORAGE_KEY = 'demiurge_openrouter_config'
 export type StoredOpenRouterConfig = {
     apiKey: string
     model?: string
+    /** Fast model for tool planning, memory rerank, reflection and summaries. */
+    auxiliaryModel?: string
 }
 
 const isBrowser = () => typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'

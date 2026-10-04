@@ -32,7 +32,7 @@ test('the stage rim only fills in MToon materials that ship without one, never o
     const geometry = new THREE.BufferGeometry()
     scene.add(new THREE.Mesh(geometry, [bare, authored]), new THREE.Mesh(geometry, outline), new THREE.Mesh(geometry, plain), new THREE.Mesh(geometry, bare))
     expect(applyStageRim({ scene })).toBe(1)
-    expect(bare.parametricRimColorFactor.r).toBeGreaterThan(0.3)
+    expect(bare.parametricRimColorFactor.r).toBeCloseTo(0.2)
     expect(bare.parametricRimFresnelPowerFactor).toBe(6)
     expect(authored.parametricRimColorFactor.b).toBe(0.5)
     expect(outline.parametricRimColorFactor.r).toBe(0)

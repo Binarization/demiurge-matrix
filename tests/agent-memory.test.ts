@@ -24,8 +24,9 @@ mock.module('../src/lib/memory-store', () => ({ memoryStore, effectiveStrength: 
 mock.module('../src/lib/memory-search', () => ({
     hybridSearch: async () => records.filter(m => m.isValid === 1),
     findSimilarByEmbedding: async () => vectorCandidates,
-    rerankWithLLM: async (_: any, candidates: any) => candidates,
+    rerankWithLLM: (...args: any[]) => rerankImpl(...args),
 }))
+let rerankImpl: (...args: any[]) => Promise<any> = async (_: any, candidates: any) => candidates
 mock.module('../src/lib/embeddings', () => ({
     isEmbeddingsAvailable: () => vectorsEnabled,
     embed: async () => [1, 0],
@@ -33,7 +34,7 @@ mock.module('../src/lib/embeddings', () => ({
         a.reduce((sum, value, index) => sum + value * b[index], 0) /
         Math.sqrt(a.reduce((sum, value) => sum + value ** 2, 0) * b.reduce((sum, value) => sum + value ** 2, 0)),
 }))
-const { Agent } = await import('../src/lib/agent')
+const { Agent, shouldSkipPlanning } = await import('../src/lib/agent')
 const { enqueueStoreMemory, recallMemoryTool, forgetMemoryTool } = await import('../src/lib/memory-tools')
 const reply = (message: any) => ({ choices: [{ message }] })
 const toolCall = (name = 'recall_memory', id = 'call1') => ({
@@ -51,6 +52,7 @@ const memory = (extra: any = {}) => ({
 })
 beforeEach(() => {
     records = []; lexicalCandidates = []; vectorCandidates = []; vectorsEnabled = false
+    rerankImpl = async (_: any, candidates: any) => candidates
 })
 
 describe('agent tool lifecycle', () => {
@@ -202,5 +204,51 @@ describe('streamed final answer',()=>{
             return (async function*(){yield {choices:[{delta:{content:'你好。'},finish_reason:'stop'}]}})()
         },{tools:[]})
         expect((await agent.run('你好',{stream:true})).content).toBe('你好。');expect(calls).toBe(1)
+    })
+})
+
+describe('first-sound latency',()=>{
+    test('short small talk skips planning unless it could need memory or the last turn used tools',()=>{
+        expect(shouldSkipPlanning('晚安',false)).toBe(true)
+        expect(shouldSkipPlanning('谢谢你呀',false)).toBe(true)
+        expect(shouldSkipPlanning('我叫小明',false)).toBe(false)
+        expect(shouldSkipPlanning('上次呢',false)).toBe(false)
+        expect(shouldSkipPlanning('好吗？',false)).toBe(false)
+        expect(shouldSkipPlanning('今天下午面试完回来了，有点累',false)).toBe(false)
+        expect(shouldSkipPlanning('晚安',true)).toBe(false)
+        expect(shouldSkipPlanning('   ',false)).toBe(false)
+    })
+    test('small talk streams the answer with no planning request',async()=>{
+        let calls=0
+        const agent=makeAgent(async(_messages:any[],options:any)=>{
+            calls++;expect(options.stream).toBe(true);expect(options.tools).toBeUndefined()
+            return (async function*(){yield {choices:[{delta:{content:'晚安。'},finish_reason:'stop'}]}})()
+        })
+        expect((await agent.run('晚安',{stream:true})).content).toBe('晚安。');expect(calls).toBe(1)
+    })
+    test('planning runs on the auxiliary model, the spoken answer on the main one',async()=>{
+        const models:string[]=[]
+        const agent=makeAgent(async(_messages:any[],options:any)=>{
+            models.push(options.model)
+            if(!options.stream)return reply({tool_calls:[{...toolCall('begin_response','finish'),function:{name:'begin_response',arguments:'{}'}}]})
+            return (async function*(){yield {choices:[{delta:{content:'小白。'},finish_reason:'stop'}]}})()
+        },{model:'main',auxiliaryModel:'fast'})
+        await agent.run('我的猫叫什么？',{stream:true})
+        expect(models).toEqual(['fast','main'])
+    })
+    test('memory rerank runs beside planning and only the spoken answer waits for it',async()=>{
+        for(let i=0;i<7;i++)records.push(memory({id:`m${i}`,content:`记忆${i}`}))
+        let release:(v:any)=>void=()=>{};const order:string[]=[]
+        rerankImpl=()=>new Promise(resolve=>{release=resolve})
+        const agent=makeAgent(async(messages:any[],options:any)=>{
+            if(!options.stream){
+                order.push('planning');setTimeout(()=>{order.push('rerank');release([memory({id:'best',content:'重排后的记忆'})])},5)
+                return reply({tool_calls:[{...toolCall('begin_response','finish'),function:{name:'begin_response',arguments:'{}'}}]})
+            }
+            order.push('answer');expect(messages[0].content).toContain('重排后的记忆')
+            return (async function*(){yield {choices:[{delta:{content:'好。'},finish_reason:'stop'}]}})()
+        },{autoInjectMemories:true,enableRerank:true,maxInjectedMemories:5})
+        await agent.run('我们上次聊到哪里了？',{stream:true})
+        expect(order).toEqual(['planning','rerank','answer'])
     })
 })
