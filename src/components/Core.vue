@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import CompanionSheet from './CompanionSheet.vue'
+import ScenePanel from './ScenePanel.vue'
+import HistorySheet from './HistorySheet.vue'
+import MemorySheet from './MemorySheet.vue'
 import { SpeechInput, type SpeechInputState } from '@/lib/speech-input'
 import { buildCyrenePrompt } from '@/lib/persona/cyrene'
 import {
@@ -29,15 +32,9 @@ import {
 } from '@/lib/companion'
 import IconChatProcessingOutline from '~icons/mdi/chat-processing-outline'
 import IconCog from '~icons/mdi/cog'
-import IconBrain from '~icons/mdi/brain'
 import { Agent } from '@/lib/agent'
 import { loadStoredOpenRouterConfig, saveStoredOpenRouterConfig } from '@/lib/openrouter-config'
-import {
-    memoryStore,
-    effectiveStrength,
-    type StoredMemory,
-    type MemoryCategory,
-} from '@/lib/memory-store'
+import { memoryStore } from '@/lib/memory-store'
 import { getGreetingMemories, formatMemoriesForPrompt } from '@/lib/memory-tools'
 import { OpenRouterClient } from '@/lib/openrouter'
 import {
@@ -46,7 +43,7 @@ import {
     DEFAULT_EMBEDDINGS_CONFIG,
     type StoredEmbeddingsConfig,
 } from '@/lib/embeddings-config'
-import { ACTION_LABELS, type BodyAction, type SceneEvent } from '@/avatar/scene/BodyDirector'
+import type { BodyAction, SceneEvent } from '@/avatar/scene/BodyDirector'
 import type { CameraView } from '@/avatar/scene/CameraDirector'
 import { parseSceneCue } from '@/avatar/scene/commands'
 import { parseGesture } from '@/avatar/utils/CompanionMotion'
@@ -134,7 +131,6 @@ const quietReturnRef = ref<HTMLButtonElement | null>(null)
 const topicsOpen = ref(false)
 const configured = ref(false)
 const composerRef = ref<HTMLInputElement | null>(null)
-const historyPinned = ref(true)
 const latestReply = computed(() =>
     [...messages.value].reverse().find(message => message.sender === 'ally')
 )
@@ -142,12 +138,6 @@ const openHistory = () => {
     closeSpeechInput()
     isChatOpen.value = true
     topicsOpen.value = false
-    historyPinned.value = true
-    scrollMessagesToBottom()
-}
-const trackHistoryScroll = () => {
-    const el = chatMessagesRef.value
-    if (el) historyPinned.value = el.scrollHeight - el.scrollTop - el.clientHeight < 72
 }
 const toggleTopics = () => {
     topicsOpen.value = !topicsOpen.value
@@ -169,9 +159,6 @@ const onComposerKeydown = (event: KeyboardEvent) => {
         submitCustomInput()
     }
 }
-const messageDate = (timestamp: number) =>
-    new Date(timestamp).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })
-const chatMessagesRef = ref<HTMLDivElement | null>(null)
 const isSettingsOpen = ref(false)
 const isMemoryPanelOpen = ref(false)
 const settingsSaved = ref(false)
@@ -197,10 +184,11 @@ const session = reactive(createSession())
 const messages = computed(() =>
     session.messages.map(entry => ({
         id: entry.id,
-        sender: entry.role === 'user' ? 'self' : 'ally',
+        sender: entry.role === 'user' ? ('self' as const) : ('ally' as const),
         text: entry.role === 'assistant' ? parseEmoteTag(entry.content).stripped : entry.content,
         status: entry.status,
         speechInterrupted: entry.speechInterrupted,
+        timestamp: entry.timestamp,
     }))
 )
 // While her voice plays, the caption reveals each phrase as it is actually
@@ -535,15 +523,6 @@ const speechInputStatus = computed(
 )
 const isGeneratingSuggestions = ref(false)
 
-const scrollMessagesToBottom = () => {
-    nextTick(() => {
-        const container = chatMessagesRef.value
-        if (container && historyPinned.value) {
-            container.scrollTop = container.scrollHeight
-        }
-    })
-}
-
 /**
  * A line she speaks first: when the partner comes back after a while, or when
  * they have stayed but gone quiet. Grounded in the real transcript tail, due
@@ -592,7 +571,6 @@ const speakFirst = async (mode: keyof typeof OPENING_NUDGE, brief: (due: FollowU
         // Rebuild the agent from the transcript so it sees the new opening line.
         agentInstance = null
         dispatchEmotion(line)
-        scrollMessagesToBottom()
     } finally {
         openingInFlight = false
     }
@@ -886,194 +864,10 @@ const updateMemoryCount = async () => {
     }
 }
 
-type MemoryView = StoredMemory & { strength: number }
-
-const allMemories = ref<MemoryView[]>([])
-const memorySearchQuery = ref('')
-const memorySort = ref<'strongest' | 'recent' | 'important'>('strongest')
-const memoryGroupBy = ref<'category' | 'none'>('category')
-const editingMemoryId = ref<string | null>(null)
-const editingMemoryContent = ref('')
-const editingMemoryImportance = ref(5)
-const editingMemoryConfidence = ref(5)
-const fileInputRef = ref<HTMLInputElement | null>(null)
-
-const loadAllMemories = async () => {
-    try {
-        const memories = await memoryStore.exportAll()
-        const valid = memories.filter(m => m.isValid === 1)
-        allMemories.value = valid.map(m => ({ ...m, strength: effectiveStrength(m) }))
-    } catch (error) {
-        console.warn('Failed to load memories:', error)
-    }
-}
-
-const filteredMemories = computed(() => {
-    const q = memorySearchQuery.value.trim().toLowerCase()
-    let list = allMemories.value
-    if (q) {
-        list = list.filter(m => m.content.toLowerCase().includes(q))
-    }
-    const sorted = [...list]
-    if (memorySort.value === 'recent') {
-        sorted.sort((a, b) => b.createdAt - a.createdAt)
-    } else if (memorySort.value === 'important') {
-        sorted.sort((a, b) => b.importance - a.importance)
-    } else {
-        sorted.sort((a, b) => b.strength - a.strength)
-    }
-    return sorted
-})
-
-const groupedMemories = computed(() => {
-    if (memoryGroupBy.value === 'none') return null
-    const groups: Record<MemoryCategory, MemoryView[]> = {
-        fact: [],
-        preference: [],
-        event: [],
-        correction: [],
-        context: [],
-    }
-    for (const m of filteredMemories.value) {
-        groups[m.category].push(m)
-    }
-    return groups
-})
-
-const categoryLabel = (cat: MemoryCategory) =>
-    ({
-        fact: '事实',
-        preference: '偏好',
-        event: '事件',
-        correction: '纠正',
-        context: '背景',
-    })[cat]
-
-const subjectLabel = (subj: string) =>
-    (
-        ({
-            user: '伙伴',
-            character: '昔涟',
-            world: '世界',
-            relationship: '关系',
-            other: '其他',
-        }) as Record<string, string>
-    )[subj] ?? subj
-
-const formatRelativeTime = (ts: number): string => {
-    const diff = Date.now() - ts
-    const mins = Math.floor(diff / 60000)
-    if (mins < 1) return '刚刚'
-    if (mins < 60) return `${mins} 分钟前`
-    const hours = Math.floor(mins / 60)
-    if (hours < 24) return `${hours} 小时前`
-    const days = Math.floor(hours / 24)
-    if (days < 30) return `${days} 天前`
-    const months = Math.floor(days / 30)
-    return `${months} 个月前`
-}
-
 const openMemoryPanel = async () => {
-    await Promise.all([loadAllMemories(), updateMemoryCount()])
+    await updateMemoryCount()
     isChatOpen.value = false
     isMemoryPanelOpen.value = true
-}
-
-const closeMemoryPanel = () => {
-    isMemoryPanelOpen.value = false
-    editingMemoryId.value = null
-}
-
-const deleteMemory = async (id: string) => {
-    try {
-        await memoryStore.invalidate(id)
-        await loadAllMemories()
-        await updateMemoryCount()
-    } catch (error) {
-        console.warn('Failed to delete memory:', error)
-    }
-}
-
-const startEditMemory = (m: MemoryView) => {
-    editingMemoryId.value = m.id
-    editingMemoryContent.value = m.content
-    editingMemoryImportance.value = m.importance
-    editingMemoryConfidence.value = m.confidence
-}
-
-const cancelEditMemory = () => {
-    editingMemoryId.value = null
-}
-
-const saveEditMemory = async () => {
-    if (!editingMemoryId.value) return
-    try {
-        await memoryStore.update(editingMemoryId.value, {
-            content: editingMemoryContent.value.trim(),
-            importance: editingMemoryImportance.value,
-            confidence: editingMemoryConfidence.value,
-        })
-        editingMemoryId.value = null
-        await loadAllMemories()
-        await updateMemoryCount()
-    } catch (error) {
-        console.warn('Failed to update memory:', error)
-    }
-}
-
-const exportMemories = async () => {
-    try {
-        const memories = await memoryStore.exportAll()
-        const blob = new Blob([JSON.stringify(memories, null, 2)], { type: 'application/json' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        const date = new Date().toISOString().slice(0, 10)
-        a.download = `cyrene-memories-${date}.json`
-        a.click()
-        URL.revokeObjectURL(url)
-    } catch (error) {
-        console.warn('Export failed:', error)
-    }
-}
-
-const triggerImport = () => {
-    fileInputRef.value?.click()
-}
-
-const handleImportFile = async (e: Event) => {
-    const input = e.target as HTMLInputElement
-    const file = input.files?.[0]
-    if (!file) return
-    try {
-        const text = await file.text()
-        const parsed = JSON.parse(text)
-        if (!Array.isArray(parsed)) {
-            alert('导入失败：文件格式不正确')
-            return
-        }
-        const count = await memoryStore.importMany(parsed)
-        await loadAllMemories()
-        await updateMemoryCount()
-        alert(`已导入 ${count} 条记忆`)
-    } catch (error) {
-        console.warn('Import failed:', error)
-        alert('导入失败：' + (error instanceof Error ? error.message : '未知错误'))
-    } finally {
-        input.value = ''
-    }
-}
-
-const clearAllMemories = async () => {
-    if (confirm('确定要清除所有记忆吗？此操作不可恢复。')) {
-        try {
-            await memoryStore.clearAll()
-            await loadAllMemories()
-            await updateMemoryCount()
-        } catch (error) {
-            console.warn('Failed to clear memories:', error)
-        }
-    }
 }
 
 const handleEmbeddingsSave = () => {
@@ -1148,7 +942,6 @@ const sendMessage = async (text: string) => {
     chatError.value = ''
     isResponding.value = true
     setInteraction('thinking')
-    scrollMessagesToBottom()
     let answer: ConversationEntry | null = null
     let voiceStream: PhraseStream | null = null
     let voiceAttempted = false
@@ -1178,7 +971,6 @@ const sendMessage = async (text: string) => {
                     persistSession()
                     lastSave = performance.now()
                 }
-                scrollMessagesToBottom()
             },
             signal: abort.signal,
             interactionContext: `${presence}上一轮心境强度：${JSON.stringify(session.mood)}。当前场景状态：${JSON.stringify(avatarRef.value?.getSceneState())}。最近实际场景互动：${JSON.stringify(session.sceneEvents?.slice(-6) ?? [])}。没有接入摄像头；用户消息可能来自键盘或用户确认发送的语音转写。`,
@@ -1194,7 +986,6 @@ const sendMessage = async (text: string) => {
         ;(voiceStream as PhraseStream | null)?.end()
         activeAnswer = null
         if (!activeSpeechId.value) setInteraction('idle')
-        scrollMessagesToBottom()
         void updateMemoryCount()
     } catch (error) {
         if (generation !== runGeneration || disposed) return
@@ -1282,7 +1073,6 @@ onMounted(async () => {
     syncCaption()
     // An opening line left unseen in an earlier background tab is on screen now.
     markOpeningSeen()
-    scrollMessagesToBottom()
 
     void updateMemoryCount()
 })
@@ -1544,70 +1334,8 @@ defineExpose({
             </div>
         </div>
 
-        <CompanionSheet :open="scenePanelOpen" title="一起待一会儿" subtitle="轻触她的头或手，也会有回应。" @close="scenePanelOpen = false">
-            <div class="scene-options">
-                <p>换个距离</p>
-                <div class="scene-choice-row">
-                    <button class="soft-button" @click="requestCameraView('companion')">陪伴视角</button>
-                    <button class="soft-button" @click="requestCameraView('full')">看看全身</button>
-                    <button class="soft-button" @click="requestCameraView('close')">近一点看</button>
-                </div>
-                <p>此刻，做点什么</p>
-                <div class="scene-action-grid">
-                    <button v-for="action in (['approach', 'return', 'stretch', 'wave', 'offer_hand', 'headpat', 'sit', 'stand'] as const)"
-                        :key="action" class="soft-button"
-                        :disabled="sceneBusy || (action === 'stand' && !sceneSeated) || (sceneSeated && ['approach', 'return', 'stretch', 'sit'].includes(action))"
-                        @click="requestBodyAction(action)">{{ ACTION_LABELS[action] }}</button>
-                </div>
-                <p class="scene-hint">在她头上轻轻划过，可以摸摸头。拖动空白处可以转动视角；手动调整时，镜头会听你的。</p>
-            </div>
-        </CompanionSheet>
-        <CompanionSheet
-            :open="isChatOpen"
-            title="共同经历"
-            subtitle="说过的话，留在这里。"
-            @opened="scrollMessagesToBottom"
-            wide
-            @close="isChatOpen = false"
-        >
-            <div class="history-tools">
-                <button class="text-button" @click="openMemoryPanel" aria-label="记忆管理">
-                    记住的小事 <span>{{ memoryCount || '' }}</span></button
-                ><button class="text-button" @click="exportConversation">导出记录</button>
-            </div>
-            <div ref="chatMessagesRef" class="conversation-pages" @scroll="trackHistoryScroll">
-                <template v-for="(msg, index) in messages" :key="msg.id">
-                    <p
-                        v-if="
-                            index === 0 ||
-                            messageDate(session.messages[index]!.timestamp) !==
-                                messageDate(session.messages[index - 1]!.timestamp)
-                        "
-                        class="memory-date"
-                    >
-                        {{ messageDate(session.messages[index]!.timestamp) }}
-                    </p>
-                    <article
-                        class="conversation-entry"
-                        :class="{ 'conversation-entry--self': msg.sender === 'self' }"
-                    >
-                        <span>{{ msg.sender === 'self' ? '你' : '昔涟' }}</span>
-                        <p>{{ msg.text }}</p>
-                        <small v-if="msg.status !== 'complete' || msg.speechInterrupted">{{
-                            msg.speechInterrupted
-                                ? '朗读已停下，文字仍在这里'
-                                : msg.status === 'pending'
-                                  ? msg.sender === 'ally'
-                                      ? '正在写下…'
-                                      : '等待回应'
-                                  : msg.status === 'failed'
-                                    ? '这次回复没有完成'
-                                    : '这一句停在了这里'
-                        }}</small>
-                    </article>
-                </template>
-            </div>
-        </CompanionSheet>
+        <ScenePanel :open="scenePanelOpen" :busy="sceneBusy" :seated="sceneSeated" @close="scenePanelOpen = false" @camera="requestCameraView" @action="requestBodyAction" />
+        <HistorySheet :open="isChatOpen" :entries="messages" :memory-count="memoryCount" @close="isChatOpen = false" @open-memory="openMemoryPanel" @export="exportConversation" />
 
         <CompanionSheet
             :open="isSettingsOpen"
@@ -1754,334 +1482,12 @@ defineExpose({
                 </div>
             </details>
         </CompanionSheet>
-        <CompanionSheet
-            :open="isMemoryPanelOpen"
-            title="记住的小事"
-            :subtitle="`留下了 ${memoryCount} 条记忆，你可以随时修改。`"
-            wide
-            @close="closeMemoryPanel"
-            ><div class="memory-content">
-                <!-- 搜索/排序工具栏 -->
-                <div class="px-8 pb-3 flex items-center gap-2 shrink-0">
-                    <input
-                        v-model="memorySearchQuery"
-                        type="text"
-                        placeholder="搜索记忆..."
-                        class="flex-1 rounded-2xl border border-white/5 bg-black/20 px-4 py-2.5 text-[14px] text-white placeholder:text-white/30 focus:bg-black/40 focus:outline-none focus:ring-1 focus:ring-white/20"
-                    />
-                    <select
-                        v-model="memorySort"
-                        class="rounded-2xl border border-white/5 bg-black/20 px-3 py-2.5 text-[13px] text-white focus:outline-none"
-                    >
-                        <option value="strongest">按强度</option>
-                        <option value="recent">按时间</option>
-                        <option value="important">按重要性</option>
-                    </select>
-                    <button
-                        @click="memoryGroupBy = memoryGroupBy === 'category' ? 'none' : 'category'"
-                        class="rounded-2xl border border-white/5 bg-black/20 px-3 py-2.5 text-[13px] text-white/70 hover:bg-white/10 transition"
-                        :title="memoryGroupBy === 'category' ? '取消分组' : '按类别分组'"
-                    >
-                        {{ memoryGroupBy === 'category' ? '已分组' : '未分组' }}
-                    </button>
-                </div>
-
-                <div class="flex-1 overflow-y-auto px-8 pb-4">
-                    <div
-                        v-if="filteredMemories.length === 0"
-                        class="py-12 text-center text-white/40"
-                    >
-                        <IconBrain class="mx-auto h-12 w-12 mb-4 opacity-50" />
-                        <p v-if="allMemories.length === 0">暂无记忆</p>
-                        <p v-else>没有匹配的记忆</p>
-                        <p class="text-sm mt-2" v-if="allMemories.length === 0">
-                            与昔涟对话时，重要信息会被自动记住
-                        </p>
-                    </div>
-
-                    <!-- 分组视图 -->
-                    <template v-else-if="groupedMemories">
-                        <div
-                            v-for="cat in [
-                                'fact',
-                                'preference',
-                                'event',
-                                'correction',
-                                'context',
-                            ] as const"
-                            :key="cat"
-                        >
-                            <div v-if="groupedMemories[cat].length > 0" class="mb-4">
-                                <h3
-                                    class="text-xs font-semibold text-white/40 uppercase tracking-wider mb-2 px-1"
-                                >
-                                    {{ categoryLabel(cat) }} ({{ groupedMemories[cat].length }})
-                                </h3>
-                                <div class="space-y-2">
-                                    <div
-                                        v-for="memory in groupedMemories[cat]"
-                                        :key="memory.id"
-                                        class="group relative rounded-2xl border border-white/5 bg-white/5 p-4 transition hover:bg-white/10"
-                                    >
-                                        <!-- 编辑模式 -->
-                                        <div v-if="editingMemoryId === memory.id" class="space-y-3">
-                                            <textarea
-                                                v-model="editingMemoryContent"
-                                                rows="3"
-                                                class="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white focus:outline-none focus:ring-1 focus:ring-white/20 resize-none"
-                                            />
-                                            <div
-                                                class="flex items-center gap-4 text-xs text-white/60"
-                                            >
-                                                <label class="flex items-center gap-2 flex-1">
-                                                    <span class="shrink-0">重要性</span>
-                                                    <input
-                                                        v-model.number="editingMemoryImportance"
-                                                        type="range"
-                                                        min="1"
-                                                        max="10"
-                                                        class="flex-1 accent-pink-400"
-                                                    />
-                                                    <span class="w-6 text-center">{{
-                                                        editingMemoryImportance
-                                                    }}</span>
-                                                </label>
-                                                <label class="flex items-center gap-2 flex-1">
-                                                    <span class="shrink-0">可信度</span>
-                                                    <input
-                                                        v-model.number="editingMemoryConfidence"
-                                                        type="range"
-                                                        min="1"
-                                                        max="10"
-                                                        class="flex-1 accent-blue-400"
-                                                    />
-                                                    <span class="w-6 text-center">{{
-                                                        editingMemoryConfidence
-                                                    }}</span>
-                                                </label>
-                                            </div>
-                                            <div class="flex justify-end gap-2">
-                                                <button
-                                                    @click="cancelEditMemory"
-                                                    class="px-3 py-1.5 text-xs text-white/60 hover:text-white"
-                                                >
-                                                    取消
-                                                </button>
-                                                <button
-                                                    @click="saveEditMemory"
-                                                    class="px-4 py-1.5 text-xs font-medium bg-white/15 hover:bg-white/25 text-white rounded-full"
-                                                >
-                                                    保存
-                                                </button>
-                                            </div>
-                                        </div>
-
-                                        <!-- 浏览模式 -->
-                                        <div v-else class="flex items-start gap-3">
-                                            <span
-                                                class="shrink-0 rounded-lg bg-pink-500/15 px-2 py-1 text-[10px] font-medium text-pink-300"
-                                            >
-                                                {{ subjectLabel(memory.subject) }}
-                                            </span>
-                                            <div class="flex-1 min-w-0">
-                                                <p class="text-sm text-white/90 leading-relaxed">
-                                                    {{ memory.content }}
-                                                </p>
-                                                <div
-                                                    class="mt-2 flex items-center gap-3 text-[10px] text-white/30 flex-wrap"
-                                                >
-                                                    <span>重要 {{ memory.importance }}</span>
-                                                    <span>可信 {{ memory.confidence }}</span>
-                                                    <span
-                                                        >强度 {{ memory.strength.toFixed(1) }}</span
-                                                    >
-                                                    <span v-if="memory.accessCount > 0"
-                                                        >访问 {{ memory.accessCount }}×</span
-                                                    >
-                                                    <span>{{
-                                                        formatRelativeTime(memory.lastAccessedAt)
-                                                    }}</span>
-                                                    <span
-                                                        v-if="memory.expiresAt"
-                                                        class="text-amber-400/60"
-                                                        >⏱
-                                                        {{
-                                                            formatRelativeTime(memory.expiresAt)
-                                                        }}</span
-                                                    >
-                                                </div>
-                                            </div>
-                                            <div
-                                                class="shrink-0 flex gap-1 memory-row-actions transition"
-                                            >
-                                                <button
-                                                    @click="startEditMemory(memory)"
-                                                    class="flex h-6 w-6 items-center justify-center rounded-full bg-white/10 text-white/60 hover:bg-white/20 hover:text-white text-xs"
-                                                    title="编辑"
-                                                >
-                                                    ✎
-                                                </button>
-                                                <button
-                                                    @click="deleteMemory(memory.id)"
-                                                    class="flex h-6 w-6 items-center justify-center rounded-full bg-red-500/20 text-red-300 hover:bg-red-500/40 text-xs"
-                                                    title="删除"
-                                                >
-                                                    ×
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </template>
-
-                    <!-- 平铺视图 -->
-                    <div v-else class="space-y-2">
-                        <div
-                            v-for="memory in filteredMemories"
-                            :key="memory.id"
-                            class="group relative rounded-2xl border border-white/5 bg-white/5 p-4 transition hover:bg-white/10"
-                        >
-                            <div v-if="editingMemoryId === memory.id" class="space-y-3">
-                                <textarea
-                                    v-model="editingMemoryContent"
-                                    rows="3"
-                                    class="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white focus:outline-none focus:ring-1 focus:ring-white/20 resize-none"
-                                />
-                                <div class="flex items-center gap-4 text-xs text-white/60">
-                                    <label class="flex items-center gap-2 flex-1">
-                                        <span class="shrink-0">重要性</span>
-                                        <input
-                                            v-model.number="editingMemoryImportance"
-                                            type="range"
-                                            min="1"
-                                            max="10"
-                                            class="flex-1 accent-pink-400"
-                                        />
-                                        <span class="w-6 text-center">{{
-                                            editingMemoryImportance
-                                        }}</span>
-                                    </label>
-                                    <label class="flex items-center gap-2 flex-1">
-                                        <span class="shrink-0">可信度</span>
-                                        <input
-                                            v-model.number="editingMemoryConfidence"
-                                            type="range"
-                                            min="1"
-                                            max="10"
-                                            class="flex-1 accent-blue-400"
-                                        />
-                                        <span class="w-6 text-center">{{
-                                            editingMemoryConfidence
-                                        }}</span>
-                                    </label>
-                                </div>
-                                <div class="flex justify-end gap-2">
-                                    <button
-                                        @click="cancelEditMemory"
-                                        class="px-3 py-1.5 text-xs text-white/60 hover:text-white"
-                                    >
-                                        取消
-                                    </button>
-                                    <button
-                                        @click="saveEditMemory"
-                                        class="px-4 py-1.5 text-xs font-medium bg-white/15 hover:bg-white/25 text-white rounded-full"
-                                    >
-                                        保存
-                                    </button>
-                                </div>
-                            </div>
-                            <div v-else class="flex items-start gap-3">
-                                <span
-                                    class="shrink-0 rounded-lg bg-pink-500/15 px-2 py-1 text-[10px] font-medium text-pink-300"
-                                >
-                                    {{ categoryLabel(memory.category) }}·{{
-                                        subjectLabel(memory.subject)
-                                    }}
-                                </span>
-                                <div class="flex-1 min-w-0">
-                                    <p class="text-sm text-white/90 leading-relaxed">
-                                        {{ memory.content }}
-                                    </p>
-                                    <div
-                                        class="mt-2 flex items-center gap-3 text-[10px] text-white/30 flex-wrap"
-                                    >
-                                        <span>重要 {{ memory.importance }}</span>
-                                        <span>可信 {{ memory.confidence }}</span>
-                                        <span>强度 {{ memory.strength.toFixed(1) }}</span>
-                                        <span v-if="memory.accessCount > 0"
-                                            >访问 {{ memory.accessCount }}×</span
-                                        >
-                                        <span>{{ formatRelativeTime(memory.lastAccessedAt) }}</span>
-                                    </div>
-                                </div>
-                                <div class="shrink-0 flex gap-1 memory-row-actions transition">
-                                    <button
-                                        @click="startEditMemory(memory)"
-                                        class="flex h-6 w-6 items-center justify-center rounded-full bg-white/10 text-white/60 hover:bg-white/20 hover:text-white text-xs"
-                                        title="编辑"
-                                    >
-                                        ✎
-                                    </button>
-                                    <button
-                                        @click="deleteMemory(memory.id)"
-                                        class="flex h-6 w-6 items-center justify-center rounded-full bg-red-500/20 text-red-300 hover:bg-red-500/40 text-xs"
-                                        title="删除"
-                                    >
-                                        ×
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <footer
-                    class="px-8 py-4 border-t border-white/5 shrink-0 flex items-center justify-between gap-2"
-                >
-                    <div class="flex gap-2">
-                        <button
-                            @click="exportMemories"
-                            class="rounded-full bg-white/10 hover:bg-white/20 px-4 py-2 text-xs font-medium text-white transition"
-                            :disabled="memoryCount === 0"
-                        >
-                            导出
-                        </button>
-                        <button
-                            @click="triggerImport"
-                            class="rounded-full bg-white/10 hover:bg-white/20 px-4 py-2 text-xs font-medium text-white transition"
-                        >
-                            导入
-                        </button>
-                        <input
-                            ref="fileInputRef"
-                            type="file"
-                            accept="application/json"
-                            class="hidden"
-                            @change="handleImportFile"
-                        />
-                    </div>
-                    <button
-                        v-if="memoryCount > 0"
-                        @click="clearAllMemories"
-                        class="rounded-full border border-red-500/30 bg-red-500/10 px-4 py-2 text-xs font-medium text-red-300 transition hover:bg-red-500/20"
-                    >
-                        清除所有
-                    </button>
-                </footer>
-            </div></CompanionSheet
-        >
+        <MemorySheet :open="isMemoryPanelOpen" :count="memoryCount" @close="isMemoryPanelOpen = false" @changed="updateMemoryCount" />
     </div>
 </template>
 
 <style scoped>
 .scene-feedback { position: fixed; z-index: 21; top: 85px; right: 36px; display: flex; align-items: center; gap: 14px; color: #eee7ec; font-size: 12px; text-shadow: 0 1px 8px #24212e; }
-.scene-options { display: grid; gap: 18px; padding: 6px 0; }
-.scene-options > p { color: var(--muted, #aca3b8); font-size: 12px; }
-.scene-choice-row { display: flex; flex-wrap: wrap; gap: 8px; }
-.scene-action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.scene-hint { line-height: 1.9; }
 @media (max-width: 600px) { .scene-feedback { right: 20px; top: 78px; } }
 .core-root {
     --ink: #24212e;
@@ -2397,21 +1803,6 @@ defineExpose({
     align-items: center;
     gap: 13px;
 }
-.text-button {
-    border: 0;
-    padding: 4px 0;
-    font: inherit;
-    font-size: 12px;
-    color: inherit;
-    background: none;
-    transition: color 0.2s;
-}
-.text-button:hover {
-    color: #fff;
-}
-.text-button:disabled {
-    opacity: 0.4;
-}
 .dock-footnote .text-button {
     font-size: 11px;
     text-shadow: 0 1px 6px #24212e;
@@ -2528,72 +1919,6 @@ defineExpose({
     margin-left: 12px;
     color: var(--petal);
 }
-.history-tools {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    padding-bottom: 22px;
-    font-size: 12px;
-    color: #c9bfce;
-}
-.history-tools span {
-    margin-left: 8px;
-    font:
-        10px ui-monospace,
-        monospace;
-    color: #aca3b8;
-}
-.conversation-pages {
-    max-height: calc(100dvh - 220px);
-    overflow-y: auto;
-    padding-right: 6px;
-    overscroll-behavior: contain;
-    scrollbar-width: thin;
-    scrollbar-color: #aca3b844 transparent;
-}
-.memory-date {
-    margin: 0 0 25px;
-    font-size: 11px;
-    color: #aca3b8;
-    letter-spacing: 0.1em;
-}
-.conversation-entry {
-    margin-bottom: 26px;
-    padding-left: 15px;
-    border-left: 1px solid #e2b8cc55;
-}
-.conversation-entry > span {
-    font-size: 11px;
-    color: #e2b8cc;
-}
-.conversation-entry > p {
-    font:
-        16px/1.85 'Songti SC',
-        'Noto Serif CJK SC',
-        serif;
-    margin: 7px 0;
-    color: #e7e2ee;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-}
-.conversation-entry small {
-    display: block;
-    color: #aca3b8;
-    font-size: 10px;
-}
-.conversation-entry--self {
-    border-color: #aca3b82b;
-}
-.conversation-entry--self > span {
-    color: #aca3b8;
-}
-.conversation-entry--self > p {
-    color: #c2baca;
-    font:
-        13px/1.85 'PingFang SC',
-        sans-serif;
-}
 .preference-section {
     padding: 24px 0;
     border-bottom: 1px solid #e7e2ee16;
@@ -2646,21 +1971,6 @@ defineExpose({
     gap: 22px;
     align-items: center;
     margin: 18px 0 6px;
-}
-.soft-button {
-    padding: 9px 15px;
-    border-radius: 10px;
-    background: #e7e2ee0d;
-    border: 1px solid #e7e2ee26;
-    color: #e7e2ee;
-    font-size: 12px;
-    line-height: 1.6;
-}
-.soft-button:hover {
-    border-color: #e2b8cc99;
-}
-.soft-button:disabled {
-    opacity: 0.45;
 }
 .preference-details summary {
     font-size: 11px;
@@ -2721,24 +2031,6 @@ defineExpose({
     align-items: center;
     font-size: 12px;
     color: #e2b8cc;
-}
-.memory-content > div,
-.memory-content > footer {
-    padding-left: 0;
-    padding-right: 0;
-}
-.memory-content > .flex.items-center {
-    flex-wrap: wrap;
-}
-.memory-content > .flex.items-center input {
-    min-width: 120px;
-}
-.memory-row-actions {
-    opacity: 0;
-}
-.group:hover .memory-row-actions,
-.group:focus-within .memory-row-actions {
-    opacity: 1;
 }
 button {
     cursor: pointer;
