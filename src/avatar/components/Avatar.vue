@@ -25,6 +25,7 @@ import { Preloader, PreloadResource, PreloaderEvent } from '@/avatar/utils/Prelo
 import { BodyDirector, type BodyAction, type SceneEvent } from '@/avatar/scene/BodyDirector'
 import { CameraDirector, type CameraView } from '@/avatar/scene/CameraDirector'
 import { createStageGeometry, disposeStage, FLOOR_Y, HOME, SEAT } from '@/avatar/scene/layout'
+import { applyStageRim, createStageLighting } from '@/avatar/scene/lighting'
 import { VrmController } from '@/avatar/utils/VrmController'
 // @ts-ignore - GaussianSplats3D doesn't have type definitions
 import * as GaussianSplats3D from '@/avatar/libs/GaussianSplats3D'
@@ -307,6 +308,7 @@ preloader.on(PreloaderEvent.COMPLETED, (resources: any) => {
 
         // 使用VrmController设置VRM模型
         vrmController.setVRM(modelVrm)
+        applyStageRim(modelVrm)
 
         // 保存VRM引用，用于位置控制
         vrmModel = modelVrm
@@ -1035,9 +1037,9 @@ onMounted(async () => {
         vrmScene.add(backgroundPlane)
         updateBackgroundTexture()
 
-        // 添加环境光到 VRM 场景
-        const vrmAmbientLight = new THREE.AmbientLight(0xffffff, 4)
-        vrmScene.add(vrmAmbientLight)
+        // Light her the way the baked sunset would: warm key from the camera
+        // side, the sun as a back light, hemisphere bounce, low ambient floor.
+        vrmScene.add(createStageLighting(HOME).group)
 
         // 5. 创建相机
         camera = new THREE.PerspectiveCamera(
