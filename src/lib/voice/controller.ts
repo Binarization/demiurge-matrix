@@ -10,6 +10,8 @@ export interface VoiceCallbacks {
     level?: (value: number | null) => void
     /** Mouth-shape weights estimated from the playing audio; null when nothing plays. */
     visemes?: (value: VisemeWeights | null) => void
+    /** The text of each phrase, fired the moment its audio starts playing. */
+    phrase?: (text: string) => void
 }
 interface Reply {
     type: string
@@ -152,24 +154,24 @@ export class LocalVoiceController {
             callbacks.end()
         }
         this.finish = end
-        const synthNext = async (): Promise<Float32Array | null> => {
+        const synthNext = async (): Promise<{ pcm: Float32Array; text: string } | null> => {
             const chunk = await phrases.next()
             if (chunk === null || generation !== this.generation) return null
             const reply = await this.request('synthesize', { text: chunk })
             if (generation !== this.generation) return null
             if (reply.metrics) this.onMetrics(reply.metrics)
-            return reply.pcm!
+            return { pcm: reply.pcm!, text: chunk }
         }
         void (async () => {
             await this.unlock()
             if (generation !== this.generation) return
-            let pcm = await synthNext()
-            while (pcm && generation === this.generation) {
-                const playing = this.play(pcm, generation, callbacks)
+            let chunk = await synthNext()
+            while (chunk && generation === this.generation) {
+                const playing = this.play(chunk.pcm, generation, callbacks, chunk.text)
                 const next = synthNext()
                 next.catch(() => {}) // Rejection must be handled while audio is playing.
                 await playing
-                pcm = await next
+                chunk = await next
             }
         })()
             .catch(error => {
@@ -189,7 +191,7 @@ export class LocalVoiceController {
             })
         return phrases
     }
-    private play(pcm: Float32Array, generation: number, callbacks: VoiceCallbacks) {
+    private play(pcm: Float32Array, generation: number, callbacks: VoiceCallbacks, text = '') {
         const context = this.context!,
             buffer = context.createBuffer(1, pcm.length, 44100)
         buffer.copyToChannel(new Float32Array(pcm), 0)
@@ -232,6 +234,7 @@ export class LocalVoiceController {
             }
             try {
                 source.start()
+                if (text) callbacks.phrase?.(text)
                 callbacks.start()
                 tick()
             } catch (e) {

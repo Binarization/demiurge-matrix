@@ -138,18 +138,6 @@ const historyPinned = ref(true)
 const latestReply = computed(() =>
     [...messages.value].reverse().find(message => message.sender === 'ally')
 )
-// The partner's own last line stays in view: bright until she has answered it, then dimmed.
-const latestPartnerLine = computed(() =>
-    [...messages.value].reverse().find(message => message.sender === 'self')
-)
-const partnerLinePending = computed(() => {
-    const line = latestPartnerLine.value
-    if (!line) return false
-    if (isResponding.value) return true
-    const list = messages.value
-    const replyIndex = latestReply.value ? list.indexOf(latestReply.value) : -1
-    return list.indexOf(line) > replyIndex
-})
 const openHistory = () => {
     closeSpeechInput()
     isChatOpen.value = true
@@ -215,6 +203,40 @@ const messages = computed(() =>
         speechInterrupted: entry.speechInterrupted,
     }))
 )
+// While her voice plays, the caption reveals each phrase as it is actually
+// spoken instead of racing ahead of the audio.
+const spokenEntryId = ref<string | null>(null)
+const spokenText = ref('')
+const captionText = computed(() => {
+    const reply = latestReply.value
+    if (!reply) return ''
+    return spokenEntryId.value === reply.id ? spokenText.value : reply.text
+})
+const captionRef = ref<HTMLDivElement | null>(null)
+const captionOverflow = ref(false)
+const syncCaption = () => {
+    nextTick(() => {
+        const el = captionRef.value
+        if (!el) return
+        captionOverflow.value = el.scrollHeight > el.clientHeight + 2
+        el.scrollTop = el.scrollHeight
+    })
+}
+watch(captionText, syncCaption)
+onMounted(() => window.addEventListener('resize', syncCaption, { passive: true }))
+onUnmounted(() => window.removeEventListener('resize', syncCaption))
+// The partner's own last line stays in view: bright until she has answered it, then dimmed.
+const latestPartnerLine = computed(() =>
+    [...messages.value].reverse().find(message => message.sender === 'self')
+)
+const partnerLinePending = computed(() => {
+    const line = latestPartnerLine.value
+    if (!line) return false
+    if (isResponding.value) return true
+    const list = messages.value
+    const replyIndex = latestReply.value ? list.indexOf(latestReply.value) : -1
+    return list.indexOf(line) > replyIndex
+})
 const storageError = ref('')
 let storageWritable = true
 const interactionState = ref<InteractionState>('idle')
@@ -332,6 +354,7 @@ const interrupt = () => {
     }
     localVoice.stop()
     activeSpeechId.value = null
+    spokenEntryId.value = null
     isResponding.value = false
     isGeneratingSuggestions.value = false
     agentInstance = null
@@ -349,7 +372,12 @@ const startVoiceStream = (entry: ConversationEntry, requestedAt?: number): Phras
     if (!voiceReady.value) return null
     voiceError.value = ''
     let first = true
+    spokenText.value = ''
+    spokenEntryId.value = entry.id
     const stream = localVoice.beginStream(voiceBackend.value, {
+        phrase: text => {
+            spokenText.value += text
+        },
         start: () => {
             if (first && requestedAt !== undefined)
                 firstAudioLatency.value = `首声 ${((performance.now() - requestedAt) / 1000).toFixed(2)} 秒`
@@ -364,11 +392,13 @@ const startVoiceStream = (entry: ConversationEntry, requestedAt?: number): Phras
             pendingSceneCue = null
             avatarRef.value?.getVrmController?.()?.cancelGestures()
             activeSpeechId.value = null
+            spokenEntryId.value = null
             if (!disposed) setInteraction(isResponding.value ? 'thinking' : 'idle')
         },
         error: () => {
             pendingSceneCue = null
             avatarRef.value?.getVrmController?.()?.cancelGestures()
+            spokenEntryId.value = null
             session.voiceEnabled = false
             voiceError.value = '昔涟声音暂不可用，朗读已关闭；文字回复已保留。'
             persistSession()
@@ -378,6 +408,7 @@ const startVoiceStream = (entry: ConversationEntry, requestedAt?: number): Phras
         visemes: value => avatarRef.value?.getVrmController?.()?.setVisemes(value),
     })
     if (stream) activeSpeechId.value = entry.id
+    else spokenEntryId.value = null
     return stream
 }
 const toggleVoice = async () => {
@@ -1248,6 +1279,7 @@ onMounted(async () => {
     } finally {
         isLoadingGreeting.value = false
     }
+    syncCaption()
     // An opening line left unseen in an earlier background tab is on screen now.
     markOpeningSeen()
     scrollMessagesToBottom()
@@ -1333,12 +1365,13 @@ defineExpose({
                     ><span>昔涟</span
                     ><small role="status">{{ stateLabels[interactionState] }}</small>
                 </div>
-                <div class="caption-text">
+                <div ref="captionRef" class="caption-text" :class="{ 'caption-text--overflow': captionOverflow }">
                     <p v-if="isLoadingGreeting" class="caption-wait">稍等，我在这里。</p>
                     <p v-else-if="isResponding && !activeAnswer" class="caption-wait">
                         让我想一想…
                     </p>
-                    <p v-else>{{ latestReply?.text || '你来啦，伙伴。' }}</p>
+                    <p v-else-if="spokenEntryId && !captionText" class="caption-wait">…</p>
+                    <p v-else>{{ captionText || '你来啦，伙伴。' }}</p>
                 </div>
             </section>
 
@@ -2215,6 +2248,12 @@ defineExpose({
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: #e7e2ee33 transparent;
+    scroll-behavior: smooth;
+}
+/* Earlier lines fade out at the top instead of being cut off. */
+.caption-text--overflow {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 30px);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 30px);
 }
 .caption-text p {
     margin: 0;
