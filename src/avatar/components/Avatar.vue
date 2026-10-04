@@ -27,6 +27,7 @@ import { CameraDirector, type CameraView } from '@/avatar/scene/CameraDirector'
 import { createStageGeometry, disposeStage, FLOOR_Y, HOME, SEAT } from '@/avatar/scene/layout'
 import { applyStageRim, createStageLighting } from '@/avatar/scene/lighting'
 import { backgroundSize, pixelRatioFor, QualityGovernor, rememberedQualityLevel, rememberQualityLevel } from '@/avatar/scene/quality'
+import { CameraDrift } from '@/avatar/scene/CameraDrift'
 import { VrmController } from '@/avatar/utils/VrmController'
 // @ts-ignore - GaussianSplats3D doesn't have type definitions
 import * as GaussianSplats3D from '@/avatar/libs/GaussianSplats3D'
@@ -446,6 +447,11 @@ const cameraRotateThreshold = 0.01 // 旋转阈值（弧度）
 
 // 标记是否正在执行相机动画
 let isCameraAnimating = false
+// Idle handheld drift; removed before the controls run and re-applied after.
+let cameraDrift: CameraDrift | null = null
+let cameraDragging = false
+const onCameraDragStart = () => { cameraDragging = true; onManualCamera() }
+const onCameraDragEnd = () => { cameraDragging = false }
 
 /**
  * 检测相机是否移动
@@ -612,12 +618,17 @@ function animate() {
             checkLowFPS(fps.value)
         }
 
+        cameraDrift?.restore()
         // 更新控制器（动画期间跳过，避免控制器干扰相机位置）
         if (controls && !isCameraAnimating && !cameraDirector?.active) {
             controls.update()
         }
 
         if (!isCameraAnimating) cameraDirector?.update(delta)
+        // Breathe only when nothing else owns the camera and the device has headroom:
+        // every drift step re-renders the splat background.
+        cameraDrift?.apply(delta, gaussianSplatReady && !isCameraAnimating && !cameraDragging &&
+            !(cameraDirector?.active ?? false) && quality.level <= 1 && !reducedMotion())
         if (yieldTo && bodyDirector && !bodyDirector.busy) {
             const action = yieldTo; yieldTo = null
             bodyDirector.play(action)
@@ -730,6 +741,7 @@ function reattachCursorTarget() {
 
 
 function onManualCamera() { cameraDirector?.manual() }
+
 function hitRegion(event: PointerEvent): 'head' | 'hand' | 'body' | null {
     if (!camera || !vrmModel || !canvas.value) return null
     const rect = canvas.value.getBoundingClientRect()
@@ -1044,8 +1056,10 @@ onMounted(async () => {
 
         if (camera && controls) {
             cameraDirector = new CameraDirector(camera, controls)
-            controls.addEventListener('start', onManualCamera)
+            controls.addEventListener('start', onCameraDragStart)
+            controls.addEventListener('end', onCameraDragEnd)
         }
+        cameraDrift = new CameraDrift(camera)
         canvas.value?.addEventListener('pointerdown', onContactStart, true)
         canvas.value?.addEventListener('pointerup', onContactEnd, true)
         canvas.value?.addEventListener('pointercancel', cancelContact, true)
@@ -1166,6 +1180,8 @@ onUnmounted(() => {
 
     // 销毁控制器
     if (controls) {
+        controls.removeEventListener('start', onCameraDragStart)
+        controls.removeEventListener('end', onCameraDragEnd)
         controls.dispose()
         controls = null
     }
