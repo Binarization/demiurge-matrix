@@ -1,6 +1,9 @@
 import * as THREE from 'three'
 import type { BodyDirector } from '../scene/BodyDirector'
 import { CompanionMotion, type Gesture, type IdleFidget } from './CompanionMotion'
+import { silentVisemes, type VisemeWeights } from '@/lib/voice/visemes'
+
+const VISEME_NAMES = ['aa', 'ih', 'ou', 'ee', 'oh'] as const
 import { emptyMood, type Mood, type InteractionState } from '@/lib/interaction'
 import { VRM } from '@pixiv/three-vrm'
 import {
@@ -765,6 +768,13 @@ export class VrmController {
     private _speechLevel: number | null = null
     setSpeechLevel(value: number | null) { this._speechLevel = value === null ? null : Math.max(0, Math.min(1, value)) }
 
+    // Mouth shapes estimated from the audio bands; eased per frame so the
+    // analyser's jitter doesn't flicker across visemes.
+    private _visemeTargets: VisemeWeights | null = null
+    private _visemeCurrent: VisemeWeights = silentVisemes()
+    setVisemes(value: VisemeWeights | null) { this._visemeTargets = value }
+    get visemes(): Readonly<VisemeWeights> { return this._visemeCurrent }
+
 
     private _updateInteraction(delta: number) {
         if (!this._vrm) return
@@ -774,10 +784,17 @@ export class VrmController {
             (this._reducedMotion?.matches ?? false) || (this.bodyDirector?.ownsPose ?? false))
         const expressions = this._vrm.expressionManager
         if (!expressions) return
-        // Mouth opening follows actual PCM energy; silence stays closed.
-        const opening = state === 'speaking' ? (this._speechLevel ?? 0) : 0
-        for (const name of ['aa', 'ih', 'ou', 'ee', 'oh']) {
-            if (expressions.expressionMap[name]) expressions.setValue(name, name === 'aa' ? opening : 0)
+        // Mouth follows the actual audio: band-estimated visemes when the
+        // voice pipeline provides them, plain energy opening on "aa" otherwise.
+        // Silence (and any state but speaking) eases back to closed.
+        const speaking = state === 'speaking'
+        const targets: VisemeWeights = speaking && this._visemeTargets ? this._visemeTargets
+            : speaking ? { ...silentVisemes(), aa: this._speechLevel ?? 0 } : silentVisemes()
+        const k = 1 - Math.exp(-delta * 28)
+        for (const name of VISEME_NAMES) {
+            const next = this._visemeCurrent[name] + (targets[name] - this._visemeCurrent[name]) * k
+            this._visemeCurrent[name] = Math.abs(next) < 1e-4 ? 0 : next
+            if (expressions.expressionMap[name]) expressions.setValue(name, this._visemeCurrent[name])
         }
     }
 

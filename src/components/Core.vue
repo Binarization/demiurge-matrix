@@ -361,6 +361,7 @@ const startVoiceStream = (entry: ConversationEntry, requestedAt?: number): Phras
         },
         level: (value: number | null) =>
             avatarRef.value?.getVrmController?.()?.setSpeechLevel(value),
+        visemes: value => avatarRef.value?.getVrmController?.()?.setVisemes(value),
     })
     if (stream) activeSpeechId.value = entry.id
     return stream

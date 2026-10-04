@@ -12,7 +12,7 @@
 
 角色提示词位于 `src/lib/persona/cyrene.ts`，对话和问候共用。资料来源、3.7知识边界、同人场景与原创行为规则见 [角色设计文档](docs/cyrene-persona.md)。未使用真实模型自动评分，人格表现仍需配置自己的 Key 后体验校准。
 
-仅支持本地昔涟模型朗读，默认关闭。模型加载并预热成功前不能开启；失败时保留文字，不会回退到系统语音。输入时停止朗读，生成过程中可点击“打断”或发送新消息。支持普通话麦克风输入，识别文字由用户确认发送；浏览器识别可能联网，首次开启前会说明。嘴部开合使用真实 PCM 能量，尚非精确音素同步。
+仅支持本地昔涟模型朗读，默认关闭。模型加载并预热成功前不能开启；失败时保留文字，不会回退到系统语音。输入时停止朗读，生成过程中可点击“打断”或发送新消息。支持普通话麦克风输入，识别文字由用户确认发送；浏览器识别可能联网，首次开启前会说明。嘴形按真实 PCM 的能量与低/中/高频段占比估计 aa、ih、ou、ee、oh 五个口型，尚非音素级同步。
 
 如果曾部署包含共享 Key 的旧版本，请在 OpenRouter 控制台撤销旧 Key，并重新构建部署；移除源码中的凭据不会使 Git 历史或旧构建中的 Key 自动失效。
 
@@ -27,7 +27,7 @@ npm run voice:check
 npm run build
 ```
 
-本地模型复制到被 Git 忽略的 `public/voice/`，开发模式使用这些文件。生产构建默认使用 `src/lib/voice/hosting.json` 中的已部署下载接口，Pages 无需包含模型；首次加载约 759 MiB，使用按内容哈希命名的 Cache Storage 缓存。配额不足仍可当次使用。角色模型仅有 Neutral，嘴部开合跟随真实音频能量，尚非音素级口型。系统/设备自带语音已移除，旧 device 设置会迁移为关闭状态。
+本地模型复制到被 Git 忽略的 `public/voice/`，开发模式使用这些文件。生产构建默认使用 `src/lib/voice/hosting.json` 中的已部署下载接口，Pages 无需包含模型；首次加载约 759 MiB，使用按内容哈希命名的 Cache Storage 缓存。配额不足仍可当次使用。角色模型仅有 Neutral，口型按真实音频的频段能量估计，尚非音素级同步。系统/设备自带语音已移除，旧 device 设置会迁移为关闭状态。
 
 浏览器回归：启动 `npm run preview -- --port 5175`，另一个终端运行 `npm run voice:test-browser`（需要本机 Chrome 与可用 WebGPU）。前处理回归：`cargo test --manifest-path voice-frontend/Cargo.toml`。来源与迁移细节见 [声音实现文档](docs/cyrene-webgpu-voice.md)。
 

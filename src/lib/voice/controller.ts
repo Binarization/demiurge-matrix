@@ -1,5 +1,6 @@
 import { PhraseStream } from './phrase-stream'
 import hosting from './hosting.json'
+import { bandEnergies, visemesFromBands, type VisemeWeights } from './visemes'
 export type VoiceBackend = 'webgpu' | 'wasm'
 export interface VoiceCallbacks {
     start: () => void
@@ -7,6 +8,8 @@ export interface VoiceCallbacks {
     end: () => void
     error: () => void
     level?: (value: number | null) => void
+    /** Mouth-shape weights estimated from the playing audio; null when nothing plays. */
+    visemes?: (value: VisemeWeights | null) => void
 }
 interface Reply {
     type: string
@@ -145,6 +148,7 @@ export class LocalVoiceController {
             if (ended) return
             ended = true
             callbacks.level?.(null)
+            callbacks.visemes?.(null)
             callbacks.end()
         }
         this.finish = end
@@ -192,17 +196,25 @@ export class LocalVoiceController {
         const source = context.createBufferSource()
         source.buffer = buffer
         const analyser = context.createAnalyser()
-        analyser.fftSize = 256
+        // 1024 samples gives ~43 Hz bins at 44.1 kHz: enough to tell the vowel bands apart.
+        analyser.fftSize = 1024
+        analyser.smoothingTimeConstant = 0.5
         source.connect(analyser)
         analyser.connect(context.destination)
         this.source = source
         const samples = new Float32Array(analyser.fftSize)
+        const spectrum = new Float32Array(analyser.frequencyBinCount)
         const tick = () => {
             if (generation !== this.generation) return
             analyser.getFloatTimeDomainData(samples)
             let energy = 0
             for (const x of samples) energy += x * x
-            callbacks.level?.(Math.min(0.85, Math.sqrt(energy / samples.length) * 4))
+            const level = Math.min(0.85, Math.sqrt(energy / samples.length) * 4)
+            callbacks.level?.(level)
+            if (callbacks.visemes) {
+                analyser.getFloatFrequencyData(spectrum)
+                callbacks.visemes(visemesFromBands(bandEnergies(spectrum, context.sampleRate, analyser.fftSize), level))
+            }
             this.frame = requestAnimationFrame(tick)
         }
         return new Promise<void>((resolve, reject) => {
@@ -213,6 +225,7 @@ export class LocalVoiceController {
                 if (generation === this.generation) {
                     cancelAnimationFrame(this.frame)
                     callbacks.level?.(0)
+                    callbacks.visemes?.(null)
                     callbacks.pause?.()
                 }
                 resolve()
