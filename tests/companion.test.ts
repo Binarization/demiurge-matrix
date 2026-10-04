@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { addFollowUps, currentFeeling, describeGap, dueFollowUps, feelingFrom, presenceContext, quietBrief, returnBrief, settleFollowUps, shouldGreetOnReturn, shouldSpeakWhileQuiet } from '../src/lib/companion'
+import { addFollowUps, currentFeeling, describeGap, dueFollowUps, feelingFrom, presenceContext, presenceCueLines, quietBrief, returnBrief, settleFollowUps, shouldGreetOnReturn, shouldSpeakWhileQuiet } from '../src/lib/companion'
 import { createSession, loadConversation, saveConversation } from '../src/lib/conversation-store'
 import { parseReflection } from '../src/lib/reflection'
 
@@ -124,4 +124,28 @@ test('a lingering feeling colours her context until it fades, and survives reloa
     const raw = JSON.parse(db.getItem('demiurge_conversation_v1')!); raw.feeling = { note: 3 }
     db.setItem('demiurge_conversation_v1', JSON.stringify(raw))
     expect(loadConversation(db).feeling).toBeUndefined()
+})
+
+test('presence cues report only what the page saw: seen opening lines, foreground time, composing time', () => {
+    const now = 700 * HOUR
+    const session = createSession()
+    session.messages.push({id:'u',role:'user',content:'嗯',timestamp:now - 40 * 60_000,status:'complete'},
+        {id:'g',role:'assistant',content:'<emote/> 光移到秋千上了。',timestamp:now - 30 * 60_000,status:'complete',kind:'greeting'})
+    expect(presenceCueLines(session, undefined, now)).toEqual(['你先开口的那句话，伙伴此前没有在前台看到，现在才看见。'])
+    session.messages[1]!.seenAt = now - 30 * 60_000
+    expect(presenceCueLines(session, { visibleForMs: 31 * 60_000, composeMs: 10_000 }, now)).toEqual([
+        '伙伴看到你先开口的那句后，过了约30分钟才回应。',
+        '页面已在前台约31分钟，伙伴这期间一直没说话。',
+    ])
+    session.messages[1]!.seenAt = now - 20_000
+    expect(presenceCueLines(session, { visibleForMs: 2 * 60_000, composeMs: 150_000 }, now)).toEqual([
+        '伙伴看到你先开口的那句，很快就回应了。',
+        '这句话伙伴斟酌了约3分钟才发出。',
+    ])
+    // Foreground time that spans beyond the last message means they talked meanwhile: not a quiet stretch.
+    session.messages.push({id:'u2',role:'user',content:'好',timestamp:now - 60_000,status:'complete'})
+    expect(presenceCueLines(session, { visibleForMs: 40 * 60_000 }, now)).toEqual([])
+    expect(presenceContext(session, [], now, { composeMs: 100_000 })).toContain('斟酌了')
+    const db = storage(); saveConversation(session, db)
+    expect(loadConversation(db).messages[1]?.seenAt).toBe(now - 20_000)
 })

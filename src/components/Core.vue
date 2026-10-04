@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import CompanionSheet from './CompanionSheet.vue'
 import { SpeechInput, type SpeechInputState } from '@/lib/speech-input'
 import { buildCyrenePrompt } from '@/lib/persona/cyrene'
@@ -449,10 +449,32 @@ const onComposerInput = () => {
     closeSpeechInput()
     onInputFocus()
 }
+// Observable presence: when the page came to the foreground, when this message
+// started being written, and whether her opening line was on screen.
+let visibleSince = Date.now()
+let composeStartedAt: number | null = null
+watch(customInput, value => {
+    if (!value.trim()) composeStartedAt = null
+    else composeStartedAt ??= Date.now()
+})
+const markOpeningSeen = () => {
+    if (document.hidden) return
+    const now = Date.now()
+    let changed = false
+    for (const entry of session.messages) {
+        if (entry.kind === 'greeting' && entry.seenAt === undefined) {
+            entry.seenAt = now
+            changed = true
+        }
+    }
+    if (changed) persistSession()
+}
 const onVisibilityChange = () => {
     if (document.hidden) closeSpeechInput()
     else {
+        visibleSince = Date.now()
         markActivity()
+        markOpeningSeen()
         if (!isLoadingGreeting.value) void greetOnReturn()
     }
 }
@@ -518,6 +540,7 @@ const speakFirst = async (mode: keyof typeof OPENING_NUDGE, brief: (due: FollowU
         if (!line || disposed || session.messages[session.messages.length - 1]?.id !== lastId) return
         if (mode === 'quiet' && (document.hidden || customInput.value.trim() || speechInputActive.value)) return
         appendEntry('assistant', line).kind = 'greeting'
+        markOpeningSeen()
         session.followUps = settleFollowUps(session.followUps, due)
         persistSession()
         // Rebuild the agent from the transcript so it sees the new opening line.
@@ -1059,7 +1082,10 @@ const sendMessage = async (text: string) => {
     suggestions.value = []
     markActivity()
     const due = dueFollowUps(session.followUps)
-    const presence = presenceContext(session, due)
+    const presence = presenceContext(session, due, Date.now(), {
+        visibleForMs: document.hidden ? undefined : Date.now() - visibleSince,
+        composeMs: composeStartedAt === null ? undefined : Date.now() - composeStartedAt,
+    })
     if (due.length) {
         session.followUps = settleFollowUps(session.followUps, due)
     }
@@ -1191,6 +1217,7 @@ onMounted(async () => {
             const greeting = await generatePersonalizedGreeting()
             if (disposed) return
             appendEntry('assistant', greeting).kind = 'greeting'
+            markOpeningSeen()
             persistSession()
             dispatchEmotion(greeting)
         } else if (configured.value && shouldGreetOnReturn(session)) {
@@ -1203,6 +1230,8 @@ onMounted(async () => {
     } finally {
         isLoadingGreeting.value = false
     }
+    // An opening line left unseen in an earlier background tab is on screen now.
+    markOpeningSeen()
     scrollMessagesToBottom()
 
     void updateMemoryCount()

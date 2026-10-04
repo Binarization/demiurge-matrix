@@ -11,8 +11,10 @@ export type ConversationEntry = {
     timestamp: number
     status: 'complete' | 'pending' | 'failed' | 'interrupted'
     speechInterrupted?: boolean
-    /** Opening line she spoke first when the partner came back. */
+    /** Opening line she spoke first when the partner came back or went quiet. */
     kind?: 'greeting'
+    /** When an opening line was first on screen with the page in the foreground. */
+    seenAt?: number
 }
 export type ConversationSession = {
     version: 1
@@ -38,7 +40,8 @@ export function loadConversation(storage: Pick<Storage, 'getItem'> = window.loca
             !['complete', 'pending', 'failed', 'interrupted'].includes(entry.status)) throw new Error('对话存档损坏，原存档未覆盖。')
         return { id: entry.id, role: entry.role, content: entry.content, timestamp: entry.timestamp,
             status: entry.status === 'pending' ? 'interrupted' : entry.status,
-            speechInterrupted: entry.speechInterrupted === true, ...(entry.kind === 'greeting' ? { kind: 'greeting' as const } : {}) }
+            speechInterrupted: entry.speechInterrupted === true, ...(entry.kind === 'greeting' ? { kind: 'greeting' as const } : {}),
+            ...(entry.kind === 'greeting' && Number.isFinite(entry.seenAt) ? { seenAt: entry.seenAt as number } : {}) }
     })
     return { version: 1, messages, sceneEvents: Array.isArray(data.sceneEvents) ? data.sceneEvents.filter((event: any) => Number.isFinite(event?.timestamp) && typeof event.action === 'string' && ['complete', 'cancel'].includes(event.outcome)).slice(-20) : [],
         followUps: Array.isArray(data.followUps) ? data.followUps.filter((item: any) => typeof item?.id === 'string' && typeof item.topic === 'string' &&

@@ -71,6 +71,14 @@ export function describeGap(ms: number): string {
     return `约${Math.round(days / 30)}个月`
 }
 
+/** A plain duration, for stretches rather than "how long ago". */
+export function describeDuration(ms: number): string {
+    if (ms < 60_000) return '不到一分钟'
+    if (ms < HOUR_MS) return `约${Math.round(ms / 60_000)}分钟`
+    if (ms < DAY_MS) return `约${Math.round(ms / HOUR_MS)}小时`
+    return `约${Math.round(ms / DAY_MS)}天`
+}
+
 export function localClock(now: Date): string {
     const pad = (n: number) => String(n).padStart(2, '0')
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -144,13 +152,44 @@ export function addFollowUps(
     return next.filter(item => !overflow.has(item.id))
 }
 
+/**
+ * Things the page can actually observe about this moment, nothing inferred:
+ * how long it has been in the foreground, how long this message took to write.
+ */
+export type PresenceCues = {
+    /** How long the page has been visible without interruption. */
+    visibleForMs?: number
+    /** From the first character typed (or dictated) to sending. */
+    composeMs?: number
+}
+
+const MINUTE_MS = 60_000
+
+/** Observable-only sentences; empty when nothing is worth noting. */
+export function presenceCueLines(session: ConversationSession, cues: PresenceCues | undefined, now = Date.now()): string[] {
+    const lines: string[] = []
+    const last = session.messages[session.messages.length - 1]
+    if (last?.role === 'assistant' && last.kind === 'greeting') {
+        if (last.seenAt === undefined) lines.push('你先开口的那句话，伙伴此前没有在前台看到，现在才看见。')
+        else if (now - last.seenAt >= 2 * MINUTE_MS) lines.push(`伙伴看到你先开口的那句后，过了${describeDuration(now - last.seenAt)}才回应。`)
+        else lines.push('伙伴看到你先开口的那句，很快就回应了。')
+    }
+    if (cues?.visibleForMs !== undefined && cues.visibleForMs >= 5 * MINUTE_MS) {
+        const sinceLast = last ? now - last.timestamp : Infinity
+        if (cues.visibleForMs <= sinceLast + MINUTE_MS) lines.push(`页面已在前台${describeDuration(cues.visibleForMs)}，伙伴这期间一直没说话。`)
+    }
+    if (cues?.composeMs !== undefined && cues.composeMs >= 90_000) lines.push(`这句话伙伴斟酌了${describeDuration(cues.composeMs)}才发出。`)
+    return lines
+}
+
 /** Per-turn presence facts appended to the interaction context. */
-export function presenceContext(session: ConversationSession, due: FollowUp[], now = Date.now()): string {
+export function presenceContext(session: ConversationSession, due: FollowUp[], now = Date.now(), cues?: PresenceCues): string {
     const parts = [`伙伴本地时间：${localClock(new Date(now))}。`]
     const first = session.messages[0]
     if (first) parts.push(`第一条对话记录在${describeGap(now - first.timestamp)}前。`)
     const previousUser = lastUserEntry(session.messages)
     if (previousUser) parts.push(`伙伴上一条消息在${describeGap(now - previousUser.timestamp)}前。`)
+    parts.push(...presenceCueLines(session, cues, now))
     const feeling = feelingLine(session, now)
     if (feeling) parts.push(feeling)
     if (due.length)
@@ -170,7 +209,7 @@ export function quietBrief(session: ConversationSession, due: FollowUp[], quietF
         .map(event => event.action)
     return [
         `伙伴本地时间：${localClock(new Date(now))}。`,
-        `页面还开着，但伙伴已经${describeGap(quietForMs)}没有动静；不知道是在忙别的还是在看着你。`,
+        `页面还开着，但伙伴已经${describeDuration(quietForMs)}没有动静；不知道是在忙别的还是在看着你。`,
         recent.length ? `刚才的对话（真实记录）：\n${recent.join('\n')}` : '',
         own.length ? `这段安静里你自己做过的小事：${own.join('；')}。` : '',
         feelingLine(session, now),
