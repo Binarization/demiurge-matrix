@@ -73,7 +73,8 @@ try {
     await page.waitForTimeout(1000)
     assert.equal(await feedbackVisible(), false, 'quiet action must not show the action bar')
     const during = await camera()
-    assert(Math.hypot(...during.map((v, i) => v - before[i])) < 0.01, 'quiet action must not cut the camera')
+    // The idle camera breathes by up to ~2 cm on its own; a cut is tens of centimetres.
+    assert(Math.hypot(...during.map((v, i) => v - before[i])) < 0.05, 'quiet action must not cut the camera')
     await page.screenshot({ path: `/tmp/cyrene-idle-${first.action}.png` })
     await page.waitForFunction(() => !window.__motionController.bodyDirector.busy, {}, { timeout: 20000 })
     assert((await sceneEvents()).some(e => e.action.startsWith('自己') && e.outcome === 'complete'), 'own actions are logged as 自己…')

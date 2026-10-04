@@ -49,7 +49,7 @@ import { parseSceneCue } from '@/avatar/scene/commands'
 import { parseGesture } from '@/avatar/utils/CompanionMotion'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
-import { nextIdleBodyAction, pickMemoryToRecall, recallEventLabel, shouldRecallMemory } from '@/lib/idle-life'
+import { useIdleLife } from '@/composables/useIdleLife'
 import { EMOTION_NAMES, type EmotionName } from '@/avatar/utils/VrmController'
 
 // Emotion-tag parser. The agent emits a leading `<emote happy=0.7 ... />` tag
@@ -581,8 +581,8 @@ const greetOnReturn = async () => {
 }
 // She has stayed quiet with the partner for a long while; one soft line, then she waits.
 const speakWhileQuiet = () => {
-    if (document.hidden || !shouldSpeakWhileQuiet(session, { now: Date.now(), lastActivityAt })) return
-    void speakFirst('quiet', due => quietBrief(session, due, Date.now() - lastActivityAt))
+    if (document.hidden || !shouldSpeakWhileQuiet(session, { now: Date.now(), lastActivityAt: idleLife.lastActivityAt })) return
+    void speakFirst('quiet', due => quietBrief(session, due, Date.now() - idleLife.lastActivityAt))
 }
 
 /**
@@ -737,14 +737,10 @@ const noticeScene = (text: string) => {
 }
 const handleSceneEvent = (event: SceneEvent) => {
     sceneBusy.value = event.phase === 'start' && !event.quiet
-    quietBusy = event.phase === 'start' && event.quiet === true
     const seated = avatarRef.value?.getSceneState().seated ?? false
-    if (seated && !sceneSeated.value) seatedSince = Date.now()
-    if (!seated) seatedSince = null
+    idleLife.noteSceneEvent(event, seated, sceneSeated.value)
     sceneSeated.value = seated
     if (event.phase !== 'start') {
-        lastBodyAt = Date.now()
-        lastIdleBodyAction = event.quiet ? event.action : null
         // A self-initiated action that got cut short never happened as far as the story goes.
         if (event.quiet && event.phase === 'cancel') return
         session.sceneEvents ??= []
@@ -771,75 +767,24 @@ const flushSceneCue = () => {
 onUnmounted(() => clearTimeout(sceneNoticeTimer))
 
 // Idle life: when the partner goes quiet she stretches, rests on the bench,
-// gets up again — quietly, without camera cuts or notices.
-let avatarReady = false
-let quietBusy = false
-let lastActivityAt = Date.now()
-let lastBodyAt = 0
-let lastIdleBodyAction: BodyAction | null = null
-let seatedSince: number | null = null
-let lastRecallAt = 0
-let recallInFlight = false
-const markActivity = () => {
-    lastActivityAt = Date.now()
-}
-// She dwells on something she remembers: the memory is really touched and the
-// moment is logged, so she can bring it up later without inventing anything.
-const rehearseMemory = async () => {
-    if (recallInFlight) return
-    recallInFlight = true
-    lastRecallAt = Date.now()
-    try {
-        const picked = pickMemoryToRecall(await memoryStore.getAllValid(), Date.now())
-        if (!picked || disposed || document.hidden || interactionState.value !== 'idle') return
-        await memoryStore.recordAccess(picked.id)
-        avatarRef.value?.getVrmController?.()?.playFidget('tilt')
+// dwells on a memory or says one soft line. Decisions live in the composable;
+// Core only says when she is free and records what she did.
+const idleLife = useIdleLife({
+    avatar: () => avatarRef.value,
+    free: () =>
+        !document.hidden && !isLoadingGreeting.value && !isResponding.value && !activeSpeechId.value &&
+        !speechInputActive.value && interactionState.value === 'idle' && !sceneBusy.value && !customInput.value.trim(),
+    busy: () => sceneBusy.value,
+    disposed: () => disposed,
+    recordSceneEvent: action => {
         session.sceneEvents ??= []
-        session.sceneEvents.push({ timestamp: Date.now(), action: recallEventLabel(picked.content), outcome: 'complete' })
+        session.sceneEvents.push({ timestamp: Date.now(), action, outcome: 'complete' })
         session.sceneEvents = session.sceneEvents.slice(-20)
         persistSession()
-    } catch (error) {
-        console.warn('Idle recall failed:', error)
-    } finally {
-        recallInFlight = false
-    }
-}
-const idleTick = () => {
-    const avatar = avatarRef.value
-    if (!avatar || !avatarReady || document.hidden || isLoadingGreeting.value || isResponding.value ||
-        activeSpeechId.value || speechInputActive.value || interactionState.value !== 'idle' ||
-        sceneBusy.value || quietBusy || customInput.value.trim()) return
-    speakWhileQuiet()
-    const scene = avatar.getSceneState()
-    const position = scene.position ?? scene.home
-    const action = nextIdleBodyAction({
-        now: Date.now(),
-        lastActivityAt,
-        lastBodyAt,
-        lastBodyAction: lastIdleBodyAction,
-        seated: scene.seated,
-        seatedSince,
-        distanceFromHome: Math.hypot(position[0]! - scene.home[0]!, position[2]! - scene.home[2]!),
-        cameraView: scene.cameraView,
-        reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
-    })
-    if (action) {
-        avatar.playBodyAction(action, { quiet: true })
-        return
-    }
-    if (shouldRecallMemory({ now: Date.now(), lastActivityAt, lastRecallAt, lastBodyAt, bodyBusy: quietBusy || sceneBusy.value }))
-        void rehearseMemory()
-}
-const ACTIVITY_EVENTS = ['pointerdown', 'keydown', 'wheel', 'touchstart'] as const
-let idleTimer: ReturnType<typeof setInterval> | undefined
-onMounted(() => {
-    for (const name of ACTIVITY_EVENTS) window.addEventListener(name, markActivity, { passive: true })
-    idleTimer = setInterval(idleTick, 5000)
+    },
+    onQuietTick: () => speakWhileQuiet(),
 })
-onUnmounted(() => {
-    for (const name of ACTIVITY_EVENTS) window.removeEventListener(name, markActivity)
-    clearInterval(idleTimer)
-})
+const markActivity = idleLife.markActivity
 
 // 处理 Avatar 加载进度
 const handleAvatarProgress = (progress: number) => {
@@ -847,8 +792,7 @@ const handleAvatarProgress = (progress: number) => {
 }
 
 const handleAvatarReady = () => {
-    avatarReady = true
-    markActivity()
+    idleLife.setAvatarReady()
     const controller = avatarRef.value?.getVrmController?.()
     controller?.setMood(session.mood)
     controller?.setInteractionState(interactionState.value)
