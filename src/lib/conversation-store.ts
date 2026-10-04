@@ -1,7 +1,7 @@
 import type { ChatMessage } from './openrouter'
 import type { Tool } from './agent'
 import { emptyMood, normalizeMood, type Mood } from './interaction'
-import type { FollowUp } from './companion'
+import type { Feeling, FollowUp } from './companion'
 
 export const CONVERSATION_KEY = 'demiurge_conversation_v1'
 export type ConversationEntry = {
@@ -23,6 +23,8 @@ export type ConversationSession = {
     voiceBackend?: 'webgpu' | 'wasm'
     sceneEvents?: Array<{ timestamp: number; action: string; outcome: 'complete' | 'cancel' }>
     followUps?: FollowUp[]
+    /** What stayed with her after the last exchange, if anything. */
+    feeling?: Feeling
 }
 export const createSession = (): ConversationSession => ({ version: 1, messages: [], mood: emptyMood(), moodUpdatedAt: Date.now(), voiceEnabled: false })
 export function loadConversation(storage: Pick<Storage, 'getItem'> = window.localStorage): ConversationSession {
@@ -40,7 +42,10 @@ export function loadConversation(storage: Pick<Storage, 'getItem'> = window.loca
     })
     return { version: 1, messages, sceneEvents: Array.isArray(data.sceneEvents) ? data.sceneEvents.filter((event: any) => Number.isFinite(event?.timestamp) && typeof event.action === 'string' && ['complete', 'cancel'].includes(event.outcome)).slice(-20) : [],
         followUps: Array.isArray(data.followUps) ? data.followUps.filter((item: any) => typeof item?.id === 'string' && typeof item.topic === 'string' &&
-            Number.isFinite(item.createdAt) && Number.isFinite(item.askAfter) && ['open', 'raised', 'dropped'].includes(item.status)) : [], mood: normalizeMood(data.mood),
+            Number.isFinite(item.createdAt) && Number.isFinite(item.askAfter) && ['open', 'raised', 'dropped'].includes(item.status)) : [],
+        ...(data.feeling && typeof data.feeling.note === 'string' && data.feeling.note.trim() && Number.isFinite(data.feeling.createdAt) && Number.isFinite(data.feeling.until)
+            ? { feeling: { note: data.feeling.note.slice(0, 60), createdAt: data.feeling.createdAt, until: data.feeling.until } } : {}),
+        mood: normalizeMood(data.mood),
         moodUpdatedAt: Number.isFinite(data.moodUpdatedAt) ? data.moodUpdatedAt : Date.now(), voiceEnabled: data.voiceEnabled === true && ['webgpu', 'wasm'].includes(data.voiceBackend),
         voiceBackend: data.voiceBackend === 'wasm' ? 'wasm' : 'webgpu' }
 }

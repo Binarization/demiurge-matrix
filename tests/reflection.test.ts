@@ -45,3 +45,16 @@ test('her own commitments and opinions are stored under the character subject', 
     expect(records.map(item => item.subject)).toEqual(['character', 'relationship'])
     expect(records.every(item => item.source === 'agent_reflection')).toBe(true)
 })
+
+test('what lingers with her is reported, and an explicit null lets it go', async () => {
+    records = []
+    const seen: any[] = []
+    const withFeeling = JSON.stringify({ memories: [], follow_ups: [], her_feeling: { note: '伙伴说她敷衍，她还有点难过', hours: 200 } })
+    await reflect({ userMessage: '你总是敷衍', assistantMessage: '是我的问题。' }, { client: client(withFeeling), onFeeling: f => seen.push(f) })
+    expect(seen).toEqual([{ note: '伙伴说她敷衍，她还有点难过', hours: 72 }])
+    await reflect({ userMessage: '刚才说重了，对不起', assistantMessage: '没事的。', priorFeeling: '她还有点难过' },
+        { client: client('{"memories":[],"follow_ups":[],"her_feeling":null}'), onFeeling: f => seen.push(f) })
+    expect(seen[1]).toBeNull()
+    await reflect({ userMessage: '今天天气好', assistantMessage: '是呢。' }, { client: client('{"memories":[]}'), onFeeling: f => seen.push(f) })
+    expect(seen).toHaveLength(2)
+})

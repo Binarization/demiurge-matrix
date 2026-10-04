@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { addFollowUps, describeGap, dueFollowUps, presenceContext, quietBrief, returnBrief, settleFollowUps, shouldGreetOnReturn, shouldSpeakWhileQuiet } from '../src/lib/companion'
+import { addFollowUps, currentFeeling, describeGap, dueFollowUps, feelingFrom, presenceContext, quietBrief, returnBrief, settleFollowUps, shouldGreetOnReturn, shouldSpeakWhileQuiet } from '../src/lib/companion'
 import { createSession, loadConversation, saveConversation } from '../src/lib/conversation-store'
 import { parseReflection } from '../src/lib/reflection'
 
@@ -106,4 +106,22 @@ test('the quiet brief tells her how long it has been and what she did meanwhile'
     expect(brief).toContain('自己想起了：伙伴喜欢星星')
     expect(brief).not.toContain('挥手')
     expect(brief).not.toContain('伸懒腰')
+})
+
+test('a lingering feeling colours her context until it fades, and survives reload', () => {
+    const now = 500 * HOUR
+    const session = createSession()
+    session.messages.push({id:'u',role:'user',content:'你总是敷衍',timestamp:now - 10 * HOUR,status:'complete'})
+    expect(feelingFrom(null, now)).toBeUndefined()
+    session.feeling = feelingFrom({ note: '伙伴说她敷衍，她还有点难过', hours: 24 }, now - 10 * HOUR)
+    expect(presenceContext(session, [], now)).toContain('还有点难过')
+    expect(presenceContext(session, [], now)).toContain('约10小时前')
+    expect(returnBrief(session, [], now)).toContain('还有点难过')
+    expect(presenceContext(session, [], now + 15 * HOUR)).not.toContain('难过')
+    expect(currentFeeling(session.feeling, now + 15 * HOUR)).toBeUndefined()
+    const db = storage(); saveConversation(session, db)
+    expect(loadConversation(db).feeling?.note).toBe('伙伴说她敷衍，她还有点难过')
+    const raw = JSON.parse(db.getItem('demiurge_conversation_v1')!); raw.feeling = { note: 3 }
+    db.setItem('demiurge_conversation_v1', JSON.stringify(raw))
+    expect(loadConversation(db).feeling).toBeUndefined()
 })

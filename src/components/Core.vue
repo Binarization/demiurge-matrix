@@ -16,7 +16,9 @@ import type { PhraseStream } from '@/lib/voice/phrase-stream'
 import { advanceMood, restingMood, type InteractionState } from '@/lib/interaction'
 import {
     addFollowUps,
+    currentFeeling,
     dueFollowUps,
+    feelingFrom,
     presenceContext,
     quietBrief,
     returnBrief,
@@ -623,6 +625,12 @@ const ensureAgent = (): Agent => {
             onFollowUps: items => {
                 if (disposed) return
                 session.followUps = addFollowUps(session.followUps, items)
+                persistSession()
+            },
+            currentFeeling: () => currentFeeling(session.feeling)?.note,
+            onFeeling: feeling => {
+                if (disposed) return
+                session.feeling = feelingFrom(feeling)
                 persistSession()
             },
             tools: [conversationRecallTool(() => session.messages)],

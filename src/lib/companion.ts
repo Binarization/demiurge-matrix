@@ -24,6 +24,29 @@ export type FollowUp = {
     status: 'open' | 'raised' | 'dropped'
 }
 
+/** Something that stayed with her after an exchange; fades by `until`. */
+export type Feeling = {
+    note: string
+    createdAt: number
+    until: number
+}
+
+export function feelingFrom(incoming: { note: string; hours: number } | null, now = Date.now()): Feeling | undefined {
+    if (!incoming) return undefined
+    const note = incoming.note.trim().slice(0, 60)
+    if (!note) return undefined
+    return { note, createdAt: now, until: now + Math.min(72, Math.max(1, incoming.hours)) * HOUR_MS }
+}
+
+export function currentFeeling(feeling: Feeling | undefined, now = Date.now()): Feeling | undefined {
+    return feeling && feeling.until > now ? feeling : undefined
+}
+
+const feelingLine = (session: ConversationSession, now: number) => {
+    const feeling = currentFeeling(session.feeling, now)
+    return feeling ? `上次对话后你心里还留着的感觉（${describeGap(now - feeling.createdAt)}前）：${feeling.note}。可以自然带出，不夸大、不反复提；伙伴解释或道歉后就放下。` : ''
+}
+
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六']
 
 export function timeOfDay(date: Date): string {
@@ -128,6 +151,8 @@ export function presenceContext(session: ConversationSession, due: FollowUp[], n
     if (first) parts.push(`第一条对话记录在${describeGap(now - first.timestamp)}前。`)
     const previousUser = lastUserEntry(session.messages)
     if (previousUser) parts.push(`伙伴上一条消息在${describeGap(now - previousUser.timestamp)}前。`)
+    const feeling = feelingLine(session, now)
+    if (feeling) parts.push(feeling)
     if (due.length)
         parts.push(`伙伴之前提过、现在可能已有结果的事：${due.map(item => item.topic).join('；')}。若与当前话题不冲突，可以自然关心一句；伙伴正忙着说别的就先放下，不追问。`)
     return parts.join('')
@@ -148,6 +173,7 @@ export function quietBrief(session: ConversationSession, due: FollowUp[], quietF
         `页面还开着，但伙伴已经${describeGap(quietForMs)}没有动静；不知道是在忙别的还是在看着你。`,
         recent.length ? `刚才的对话（真实记录）：\n${recent.join('\n')}` : '',
         own.length ? `这段安静里你自己做过的小事：${own.join('；')}。` : '',
+        feelingLine(session, now),
         due.length ? `伙伴之前提过、现在可能已有结果的事：${due.map(item => item.topic).join('；')}。只在合适时轻轻问一件。` : '',
     ].filter(Boolean).join('\n')
 }
@@ -163,6 +189,7 @@ export function returnBrief(session: ConversationSession, due: FollowUp[], now =
         `伙伴本地时间：${localClock(new Date(now))}。`,
         last ? `距离上次对话：${describeGap(now - last.timestamp)}。` : '',
         recent.length ? `上次对话结尾（真实记录）：\n${recent.join('\n')}` : '',
+        feelingLine(session, now),
         due.length ? `伙伴之前提过、现在可能已有结果的事：${due.map(item => item.topic).join('；')}。挑最重要的一件轻轻问起。` : '',
     ].filter(Boolean).join('\n')
 }

@@ -20,6 +20,8 @@ export type ReflectionInput = {
     assistantMessage: string
     /** Last few prior turns for context. Each "user: ..." or "assistant: ..." string. */
     priorContext?: string[]
+    /** What she was still carrying before this exchange, if anything. */
+    priorFeeling?: string
 }
 
 type ExtractedMemory = {
@@ -53,6 +55,8 @@ const SYSTEM_PROMPT = `你是一名记忆抽取员。从一段"用户(伙伴)"�
 
 另外，如果伙伴提到了之后才会有结果、值得过后关心一句的具体事情（考试、面试、看病、出行、截止日期、重要的见面），列入 follow_ups。只收伙伴本人明确说到的事，不收日常琐事，不替伙伴编造计划。
 
+her_feeling 是昔涟这一轮之后心里还会留着的感觉：只在这段对话里发生了会在一个人心里留一阵子的事时填写（被伙伴的话伤到、为伙伴担心、因为一个承诺或好消息而高兴、吵了架还没说开）。平常的闲聊填 null。如果输入里给出了她此前留着的感觉：伙伴这轮回应或化解了它，就填 null 或换成新的感觉；伙伴没有提及，就照抄保留（小时数可以缩短）。note 用第三人称客观描述原因与感觉（≤40字，如"伙伴说她敷衍，她还有点难过，想下次听得更仔细"），hours 是这种感觉大概会留多久（1—72）。
+
 按以下 JSON 对象格式输出（没有内容就用空数组）：
 {
   "memories": [
@@ -67,15 +71,34 @@ const SYSTEM_PROMPT = `你是一名记忆抽取员。从一段"用户(伙伴)"�
   ],
   "follow_ups": [
     { "topic": "之后要问起的事（≤ 20 字，如：周五面试的结果）", "ask_after_hours": 事情大概有结果后的小时数 }
-  ]
+  ],
+  "her_feeling": null 或 { "note": "原因与感觉（≤ 40 字）", "hours": 1-72 }
 }
 
 只输出 JSON，不要说明。`
 
 export type ExtractedFollowUp = { topic: string; askAfterHours: number }
+/** What stays with her after this exchange; `null` means nothing lingers. */
+export type ExtractedFeeling = { note: string; hours: number }
+export type ParsedReflection = {
+    memories: unknown[]
+    followUps: ExtractedFollowUp[]
+    /** `undefined` when the model did not address it; `null` when it explicitly let go. */
+    feeling: ExtractedFeeling | null | undefined
+}
 
-/** Accepts the `{memories, follow_ups}` object or a legacy bare memory array. */
-export function parseReflection(text: string): { memories: unknown[]; followUps: ExtractedFollowUp[] } {
+function parseFeeling(value: unknown): ExtractedFeeling | null | undefined {
+    if (value === undefined) return undefined
+    if (value === null) return null
+    if (!value || typeof value !== 'object') return undefined
+    const note = typeof (value as any).note === 'string' ? (value as any).note.trim() : ''
+    const hours = Number((value as any).hours)
+    if (!note || note.length > 80 || !Number.isFinite(hours) || hours <= 0) return undefined
+    return { note: note.slice(0, 60), hours: Math.min(72, Math.max(1, hours)) }
+}
+
+/** Accepts the `{memories, follow_ups, her_feeling}` object or a legacy bare memory array. */
+export function parseReflection(text: string): ParsedReflection {
     const tryParse = (source: string | undefined) => {
         if (!source) return undefined
         try {
@@ -85,14 +108,14 @@ export function parseReflection(text: string): { memories: unknown[]; followUps:
         }
     }
     const parsed = tryParse(text.match(/\{[\s\S]*\}/)?.[0]) ?? tryParse(text.match(/\[[\s\S]*\]/)?.[0])
-    if (Array.isArray(parsed)) return { memories: parsed, followUps: [] }
-    if (!parsed || typeof parsed !== 'object') return { memories: [], followUps: [] }
+    if (Array.isArray(parsed)) return { memories: parsed, followUps: [], feeling: undefined }
+    if (!parsed || typeof parsed !== 'object') return { memories: [], followUps: [], feeling: undefined }
     const followUps = (Array.isArray(parsed.follow_ups) ? parsed.follow_ups : []).flatMap((item: any): ExtractedFollowUp[] => {
         const topic = typeof item?.topic === 'string' ? item.topic.trim() : ''
         const hours = Number(item?.ask_after_hours)
         return topic && topic.length <= 40 && Number.isFinite(hours) && hours > 0 ? [{ topic, askAfterHours: hours }] : []
     })
-    return { memories: Array.isArray(parsed.memories) ? parsed.memories : [], followUps }
+    return { memories: Array.isArray(parsed.memories) ? parsed.memories : [], followUps, feeling: parseFeeling(parsed.her_feeling) }
 }
 
 function sanitize(item: unknown): ExtractedMemory | null {
@@ -120,6 +143,8 @@ export type ReflectionOptions = {
     model?: string
     /** Receives things worth asking about later. */
     onFollowUps?: (items: ExtractedFollowUp[]) => void
+    /** Receives what lingers with her after this turn; `null` when she has let go. */
+    onFeeling?: (feeling: ExtractedFeeling | null) => void
 }
 
 /**
@@ -130,7 +155,8 @@ export async function reflect(input: ReflectionInput, options: ReflectionOptions
     if (!input.userMessage.trim() && !input.assistantMessage.trim()) return []
 
     const priorBlock = (input.priorContext ?? []).slice(-4).join('\n')
-    const transcript = `【当前伙伴本地时间】${localClock(new Date())}\n${priorBlock ? priorBlock + '\n' : ''}伙伴：${input.userMessage}\n昔涟：${input.assistantMessage}`
+    const feelingBlock = input.priorFeeling ? `【她此前心里留着的感觉】${input.priorFeeling}\n` : ''
+    const transcript = `【当前伙伴本地时间】${localClock(new Date())}\n${feelingBlock}${priorBlock ? priorBlock + '\n' : ''}伙伴：${input.userMessage}\n昔涟：${input.assistantMessage}`
 
     let raw: string
     try {
@@ -149,6 +175,7 @@ export async function reflect(input: ReflectionInput, options: ReflectionOptions
 
     const parsed = parseReflection(raw)
     if (parsed.followUps.length) options.onFollowUps?.(parsed.followUps)
+    if (parsed.feeling !== undefined) options.onFeeling?.(parsed.feeling)
     const extracted = parsed.memories.map(sanitize).filter((x): x is ExtractedMemory => x !== null)
     if (extracted.length === 0) return []
 
