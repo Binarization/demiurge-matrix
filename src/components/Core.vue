@@ -47,7 +47,7 @@ import { parseSceneCue } from '@/avatar/scene/commands'
 import { parseGesture } from '@/avatar/utils/CompanionMotion'
 import Avatar from '@/avatar/components/Avatar.vue'
 import { generateChatSuggestions } from '@/lib/chatSuggestions'
-import { nextIdleBodyAction } from '@/lib/idle-life'
+import { nextIdleBodyAction, pickMemoryToRecall, recallEventLabel, shouldRecallMemory } from '@/lib/idle-life'
 import { EMOTION_NAMES, type EmotionName } from '@/avatar/utils/VrmController'
 
 // Emotion-tag parser. The agent emits a leading `<emote happy=0.7 ... />` tag
@@ -704,8 +704,31 @@ let lastActivityAt = Date.now()
 let lastBodyAt = 0
 let lastIdleBodyAction: BodyAction | null = null
 let seatedSince: number | null = null
+let lastRecallAt = 0
+let recallInFlight = false
 const markActivity = () => {
     lastActivityAt = Date.now()
+}
+// She dwells on something she remembers: the memory is really touched and the
+// moment is logged, so she can bring it up later without inventing anything.
+const rehearseMemory = async () => {
+    if (recallInFlight) return
+    recallInFlight = true
+    lastRecallAt = Date.now()
+    try {
+        const picked = pickMemoryToRecall(await memoryStore.getAllValid(), Date.now())
+        if (!picked || disposed || document.hidden || interactionState.value !== 'idle') return
+        await memoryStore.recordAccess(picked.id)
+        avatarRef.value?.getVrmController?.()?.playFidget('tilt')
+        session.sceneEvents ??= []
+        session.sceneEvents.push({ timestamp: Date.now(), action: recallEventLabel(picked.content), outcome: 'complete' })
+        session.sceneEvents = session.sceneEvents.slice(-20)
+        persistSession()
+    } catch (error) {
+        console.warn('Idle recall failed:', error)
+    } finally {
+        recallInFlight = false
+    }
 }
 const idleTick = () => {
     const avatar = avatarRef.value
@@ -725,7 +748,12 @@ const idleTick = () => {
         cameraView: scene.cameraView,
         reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
     })
-    if (action) avatar.playBodyAction(action, { quiet: true })
+    if (action) {
+        avatar.playBodyAction(action, { quiet: true })
+        return
+    }
+    if (shouldRecallMemory({ now: Date.now(), lastActivityAt, lastRecallAt, lastBodyAt, bodyBusy: quietBusy || sceneBusy.value }))
+        void rehearseMemory()
 }
 const ACTIVITY_EVENTS = ['pointerdown', 'keydown', 'wheel', 'touchstart'] as const
 let idleTimer: ReturnType<typeof setInterval> | undefined

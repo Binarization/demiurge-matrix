@@ -1,6 +1,6 @@
 import * as THREE from 'three'
 import type { BodyDirector } from '../scene/BodyDirector'
-import { CompanionMotion, type Gesture } from './CompanionMotion'
+import { CompanionMotion, type Gesture, type IdleFidget } from './CompanionMotion'
 import { emptyMood, type Mood, type InteractionState } from '@/lib/interaction'
 import { VRM } from '@pixiv/three-vrm'
 import {
@@ -756,6 +756,11 @@ export class VrmController {
         this._motion.request(gesture, waitForAudio && this._interactionState !== 'speaking')
     }
     cancelGestures() { this._motion.cancel() }
+    /** A small idle motion on request, only while she is idle and not posing. */
+    playFidget(name: IdleFidget): boolean {
+        if (this._interactionState !== 'idle' || this.bodyDirector?.ownsPose) return false
+        return this._motion.startFidget(name)
+    }
 
     private _speechLevel: number | null = null
     setSpeechLevel(value: number | null) { this._speechLevel = value === null ? null : Math.max(0, Math.min(1, value)) }

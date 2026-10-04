@@ -37,6 +37,13 @@ export class CompanionMotion {
 
     constructor(private readonly random: () => number = Math.random) { this.nextFidgetAt = 14 + random() * 10 }
     get currentFidget() { return this.fidget?.name ?? null }
+    /** Start a specific fidget now (e.g. a moment of drifting off); false if she is busy. */
+    startFidget(name: IdleFidget): boolean {
+        if (this.fidget || this.gesture || this.pending) return false
+        this.fidget = { name, started: this.time, side: this.random() < 0.5 ? -1 : 1 }
+        this.nextFidgetAt = this.idleFor + FIDGET_SECONDS[name] + 16 + this.random() * 26
+        return true
+    }
 
     request(gesture: Gesture, waitForAudio: boolean) {
         if (this.time - this.lastGesture < 5) return
