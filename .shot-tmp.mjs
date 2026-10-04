@@ -13,5 +13,5 @@ const enter = page.getByRole('button').filter({ hasText: /陪伴|进入|开始|�
 try { await enter.click({ timeout: 120000 }); console.log('entered after', Date.now() - t0, 'ms') } catch (e) { console.log('enter fail', e.message.split('\n')[0]) }
 await page.waitForTimeout(8000)
 console.log('gl:', await page.evaluate(() => { const c = document.createElement('canvas'); const gl = c.getContext('webgl2'); const d = gl?.getExtension('WEBGL_debug_renderer_info'); return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : 'none' }))
-await page.screenshot({ path: '/tmp/ui-scene-after2.png' })
+await page.screenshot({ path: '/tmp/ui-scene-quality.png' })
 await browser.close()

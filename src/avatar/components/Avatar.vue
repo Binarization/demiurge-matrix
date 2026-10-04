@@ -26,6 +26,7 @@ import { BodyDirector, type BodyAction, type SceneEvent } from '@/avatar/scene/B
 import { CameraDirector, type CameraView } from '@/avatar/scene/CameraDirector'
 import { createStageGeometry, disposeStage, FLOOR_Y, HOME, SEAT } from '@/avatar/scene/layout'
 import { applyStageRim, createStageLighting } from '@/avatar/scene/lighting'
+import { backgroundSize, pixelRatioFor, QualityGovernor, rememberedQualityLevel, rememberQualityLevel } from '@/avatar/scene/quality'
 import { VrmController } from '@/avatar/utils/VrmController'
 // @ts-ignore - GaussianSplats3D doesn't have type definitions
 import * as GaussianSplats3D from '@/avatar/libs/GaussianSplats3D'
@@ -187,9 +188,6 @@ const cursorHit = new THREE.Vector3()
 
 // 背景渲染相关
 const INITIAL_RENDER_FRAME_COUNT = 60 // 初始强制渲染帧数
-const LOW_PERFORMANCE_FPS_THRESHOLD = 50
-const LOW_PERFORMANCE_FPS_COUNTER_THRESHOLD = 5
-const LOW_RESOLUTION_SCALE_FACTOR = 0.25
 let backgroundScene: THREE.Scene | null = null // 背景场景（GaussianSplat + 天空球）
 let vrmScene: THREE.Scene | null = null // VRM 场景
 let backgroundRenderTarget: THREE.WebGLRenderTarget | null = null // 背景渲染目标
@@ -197,8 +195,10 @@ let backgroundPlane: THREE.Mesh | null = null // 用于显示背景纹理的平�
 let needUpdateBackground = true // 是否需要更新背景
 let initialRenderFrames = 0 // 初始渲染帧数计数器
 let gaussianSplatReady = false // GaussianSplat3D 是否已准备好（从 viewer.viewer.splatRenderReady 同步）
-let lowResolutionMode = false // 是否处于低分辨率模式
-let lowPerformanceFpsCounter = 0 // 低性能 FPS 计数器
+// Quality ladder: capped pixel ratio plus a stepped background resolution,
+// driven by the measured frame rate and remembered per GPU.
+let quality = new QualityGovernor()
+let rendererInfoCache: string | null = null
 
 // 材质缓存
 let skyMaterial: THREE.ShaderMaterial | null = null
@@ -533,29 +533,28 @@ function createRenderTarget(w: number, h: number) {
 }
 
 function checkLowFPS(currentFps: number) {
-    // 在高斯泼溅渲染阶段过半后再检测低帧率
-    if (initialRenderFrames >= INITIAL_RENDER_FRAME_COUNT && !lowResolutionMode && currentFps < LOW_PERFORMANCE_FPS_THRESHOLD) {
-        lowPerformanceFpsCounter++
+    // Only judge frame rate once the splat has finished its forced initial frames.
+    if (initialRenderFrames < INITIAL_RENDER_FRAME_COUNT) return
+    const level = quality.sample(currentFps, performance.now())
+    if (level === null) return
+    applyQuality()
+    initialRenderFrames = 0 // redraw the background at the new size
+    console.log(`[Avatar] quality → ${quality.tier.name} (fps ${currentFps})`)
+    rememberQualityLevel(localStorage, rendererInfoCache ?? getRendererInfo(), level)
+}
 
-        if (lowPerformanceFpsCounter >= LOW_PERFORMANCE_FPS_COUNTER_THRESHOLD) {
-            // 切换到低分辨率模式
-            lowResolutionMode = true
-            setLowResolutionRenderTarget()
-            initialRenderFrames = 0 // 重置初始渲染帧数计数器
-            console.log('[Avatar] Low FPS detected: ', currentFps)
-
-            // 记录设备低性能标记
-            try {
-                const rendererInfo = getRendererInfo()
-
-                if (rendererInfo) {
-                    localStorage.setItem('low_performance_device', rendererInfo)
-                }
-            } catch (e) {
-                // ignore localStorage errors (e.g. private mode)
-            }
-        }
+/** Resize renderer pixel ratio and the background target to the current tier. */
+function applyQuality() {
+    if (!renderer) return
+    const tier = quality.tier
+    renderer.setPixelRatio(pixelRatioFor(tier, window.devicePixelRatio))
+    const { width, height } = backgroundSize(tier, window.innerWidth, window.innerHeight, window.devicePixelRatio)
+    if (backgroundRenderTarget) backgroundRenderTarget.setSize(width, height)
+    else {
+        backgroundRenderTarget = createRenderTarget(width, height)
+        updateBackgroundTexture()
     }
+    needUpdateBackground = true
 }
 
 function getRendererInfo(): string | null {
@@ -584,28 +583,6 @@ const updateBackgroundTexture = () => {
         material.uniformsNeedUpdate = true
         needUpdateBackground = true
     }
-}
-
-function getLowResolutionDimensions() {
-    if (!renderer) return { width: 0, height: 0 }
-
-    const w = Math.floor(window.innerWidth * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR)
-    const h = Math.floor(window.innerHeight * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR)
-
-    return { width: w, height: h }
-}
-
-function setLowResolutionRenderTarget() {
-    if (!renderer) return
-
-    const { width: w, height: h } = getLowResolutionDimensions()
-
-    if (backgroundRenderTarget) {
-        backgroundRenderTarget.dispose()
-    }
-
-    backgroundRenderTarget = createRenderTarget(w, h)
-    updateBackgroundTexture()
 }
 
 /**
@@ -709,17 +686,8 @@ function onWindowResize() {
         renderer.setSize(width, height)
 
         // 更新 RenderTarget 尺寸
-        if (lowResolutionMode) {
-            backgroundRenderTarget.setSize(
-                Math.floor(width * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR),
-                Math.floor(height * window.devicePixelRatio * LOW_RESOLUTION_SCALE_FACTOR)
-            )
-        } else {
-            backgroundRenderTarget.setSize(
-                width * window.devicePixelRatio,
-                height * window.devicePixelRatio
-            )
-        }
+        const size = backgroundSize(quality.tier, width, height, window.devicePixelRatio)
+        backgroundRenderTarget.setSize(size.width, size.height)
 
         // 标记需要更新背景
         needUpdateBackground = true
@@ -892,27 +860,12 @@ onMounted(async () => {
         const width = window.innerWidth
         const height = window.innerHeight
         renderer.setSize(width, height)
-        renderer.setPixelRatio(window.devicePixelRatio)
 
-        // 2. 创建 RenderTarget 用于背景渲染
-        const rendererInfo = getRendererInfo()
-        if (rendererInfo) {
-            // 检查 localStorage 中是否有低性能设备标记
-            const lowPerfFlag = localStorage.getItem('low_performance_device')
-            if (lowPerfFlag && rendererInfo === lowPerfFlag) {
-                lowResolutionMode = true
-            }
-        }
-
-        if (lowResolutionMode) {
-            const { width: w, height: h } = getLowResolutionDimensions()
-            backgroundRenderTarget = createRenderTarget(w, h)
-        } else {
-            backgroundRenderTarget = createRenderTarget(
-                width * window.devicePixelRatio,
-                height * window.devicePixelRatio
-            )
-        }
+        // 2. Start at the quality tier this GPU settled on last time, then
+        // create the background render target at that tier's size.
+        rendererInfoCache = getRendererInfo()
+        quality = new QualityGovernor(rememberedQualityLevel(localStorage, rendererInfoCache))
+        applyQuality()
 
         // 3. 创建背景场景（GaussianSplat + 天空球）
         backgroundScene = new THREE.Scene()
@@ -1008,7 +961,7 @@ onMounted(async () => {
         if (!backgroundMaterial) {
             backgroundMaterial = new THREE.ShaderMaterial({
                 uniforms: {
-                    tBackground: { value: backgroundRenderTarget.texture },
+                    tBackground: { value: backgroundRenderTarget?.texture ?? null },
                 },
                 vertexShader: `
                     varying vec2 vUv;
