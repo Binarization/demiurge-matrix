@@ -648,5 +648,13 @@ export async function getGreetingMemories(): Promise<StoredMemory[]> {
             memories.push(m)
         }
     }
-    return memories.sort((a, b) => effectiveStrength(b) - effectiveStrength(a)).slice(0, 5)
+    // Her own recent commitments and opinions: what she said she'd do, what she holds.
+    const own = await memoryStore.getBySubject('character', 6)
+    for (const m of own.filter(c => c.importance >= 5)) {
+        if (!seen.has(m.id)) {
+            seen.add(m.id)
+            memories.push(m)
+        }
+    }
+    return memories.sort((a, b) => effectiveStrength(b) - effectiveStrength(a)).slice(0, 6)
 }
